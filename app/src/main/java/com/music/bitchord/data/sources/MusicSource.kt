@@ -1,6 +1,7 @@
 package com.music.bitchord.data.sources
 
 import com.music.bitchord.data.model.Song
+import java.util.Locale
 
 /**
  * What a source is about to hand the decoder, as far as the source will say.
@@ -32,17 +33,22 @@ data class StreamFormat(
     val isLossless: Boolean?
         get() = codec?.let { it in LOSSLESS_CODECS }
 
+    /** Dolby Atmos carried in E-AC-3 JOC. This is immersive, but not lossless. */
+    val isDolbyAtmos: Boolean
+        get() = codec in DOLBY_ATMOS_CODECS
+
     /** "24-bit · 192 kHz", "FLAC", "320 kbps" — whichever parts are known. */
     val summary: String
-        get() = listOfNotNull(
-            codec?.uppercase(),
+        get() = if (isDolbyAtmos) "Dolby Atmos" else listOfNotNull(
+            codec?.uppercase(Locale.ROOT),
             bitDepth?.let { "$it-bit" },
-            sampleRateHz?.let { "${"%.1f".format(it / 1000f).removeSuffix(".0")} kHz" },
+            sampleRateHz?.let { "${"%.1f".format(Locale.ROOT, it / 1000f).removeSuffix(".0")} kHz" },
             kbps?.takeIf { isLossless != true }?.let { "$it kbps" },
         ).joinToString(" · ").ifEmpty { "Unknown format" }
 
     private companion object {
         val LOSSLESS_CODECS = setOf("flac", "alac", "wav", "aiff", "ape", "wv", "dsf", "dff")
+        val DOLBY_ATMOS_CODECS = setOf("eac3-joc", "ec3-joc", "dolby-atmos")
     }
 }
 

@@ -50,8 +50,8 @@ android {
         // Haze falls back to a translucent scrim below that.
         minSdk = 26
         targetSdk = 36
-        versionCode = 8
-        versionName = "1.5-beta1"
+        versionCode = 11
+        versionName = "v1.5.1beta1"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
@@ -61,13 +61,14 @@ android {
         // Last.fm credentials are supplied locally and never committed.
         buildConfigField("String", "LASTFM_API_KEY", "\"${lastfmApiKey.replace("\\", "\\\\").replace("\"", "\\\"")}\"")
         buildConfigField("String", "LASTFM_SECRET", "\"${lastfmSecret.replace("\\", "\\\\").replace("\"", "\\\"")}\"")
+    }
 
-        // Automix's DSP analyzer (native/analyzer). 64-bit only: minSdk 26
-        // already postdates the 64-bit requirement, so a 32-bit slice would
-        // double the native payload for devices that do not exist in the
-        // install base.
-        ndk {
-            abiFilters += listOf("arm64-v8a", "x86_64")
+    splits {
+        abi {
+            isEnable = true
+            reset()
+            include("arm64-v8a", "x86_64")
+            isUniversalApk = false
         }
     }
 
@@ -86,7 +87,7 @@ android {
         create("dev") {
             dimension = "env"
             applicationId = "com.dev.bitchord"
-            resValue("string", "app_name", "bitchord Dev")
+            resValue("string", "app_name", "BitChord Dev")
         }
         create("prod") {
             dimension = "env"
@@ -143,6 +144,17 @@ android {
         compose = true
         buildConfig = true
     }
+    testOptions {
+        unitTests {
+            // Unit tests run against a stub android.jar whose methods throw
+            // rather than return. That is the right default for anything whose
+            // behaviour depends on the framework, and wrong for android.util.Log
+            // — which [TrackLog] calls on every decision the source layer makes,
+            // so a test of that layer fails on the logging rather than on the
+            // logic it was written to check.
+            isReturnDefaultValues = true
+        }
+    }
 }
 
 kotlin {
@@ -189,6 +201,13 @@ dependencies {
     // ---- Compose (Material 3) ----
     val composeBom = platform("androidx.compose:compose-bom:2024.12.01")
     implementation(composeBom)
+    // Pinned above the BOM's 1.7.6: [IosOverscroll] uses OverscrollFactory,
+    // which that version doesn't have. Newer foundation alongside the BOM's
+    // older ui/material3 is a combination Compose supports deliberately —
+    // foundation depends on ui, not the reverse — and this exact pairing was
+    // already in effect (foundation was reaching 1.10.0 transitively through
+    // the liquid-glass library before that dependency was removed).
+    implementation("androidx.compose.foundation:foundation:1.10.0")
     implementation("androidx.compose.ui:ui")
     implementation("androidx.compose.ui:ui-graphics")
     implementation("androidx.compose.ui:ui-tooling-preview")
@@ -199,6 +218,7 @@ dependencies {
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.7")
     implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.7")
     implementation("androidx.core:core-ktx:1.15.0")
+    implementation("androidx.appcompat:appcompat:1.7.0")
     debugImplementation("androidx.compose.ui:ui-tooling")
 
     // ---- Media playback: Media3 / ExoPlayer ----
@@ -219,6 +239,12 @@ dependencies {
     // ---- Frosted glass / progressive blur (Telegram-style bars) ----
     implementation("dev.chrisbanes.haze:haze:1.3.1")
     implementation("dev.chrisbanes.haze:haze-materials:1.3.1")
+
+    // ---- Markdown rendering (release notes in the update dialog) ----
+    // Pure Compose, not an AndroidView wrapper — needed so the text composes
+    // correctly under the dialog's Haze blur.
+    implementation("com.halilibo.compose-richtext:richtext-ui-material3:0.20.0")
+    implementation("com.halilibo.compose-richtext:richtext-commonmark:0.20.0")
 
     // ---- Innertube (YouTube Music) client: Ktor + kotlinx.serialization ----
     implementation("io.ktor:ktor-client-core:3.0.3")
@@ -254,7 +280,7 @@ dependencies {
     // ---- Auth/session storage ----
     implementation("androidx.security:security-crypto:1.1.0-alpha06")
 
-    // ---- JS module execution: QuickJS VM for Convx-style source plugins ----
+    // ---- JS module execution: QuickJS VM for style source plugins ----
     implementation("io.github.dokar3:quickjs-kt-android:1.0.5")
 
     // ---- Automix: on-device beat/downbeat model (Beat This!, MIT-licensed) ----

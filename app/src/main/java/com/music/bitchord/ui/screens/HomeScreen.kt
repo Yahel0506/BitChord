@@ -9,6 +9,7 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
@@ -40,12 +41,14 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.Folder
 import androidx.compose.material.icons.rounded.LibraryMusic
 import com.music.bitchord.ui.icons.BitChordIcons
+import com.music.bitchord.R
 import coil3.compose.AsyncImage
 import com.music.bitchord.data.model.CARD_ART_PX
 import com.music.bitchord.data.model.HEADER_ART_PX
@@ -61,6 +64,7 @@ import com.music.bitchord.ui.components.SHELF_CARD_WIDTH
 import com.music.bitchord.ui.components.SignInBanner
 import com.music.bitchord.ui.components.feedMoreSkeleton
 import com.music.bitchord.ui.components.feedSkeleton
+import com.music.bitchord.ui.components.recentlyPlayedSkeleton
 import com.music.bitchord.ui.components.heroCardWidth
 import com.music.bitchord.ui.components.thumbnailBorder
 import com.music.bitchord.ui.player.MeshGradientBackground
@@ -78,7 +82,7 @@ fun HomeScreen(
     pullState: PullToRefreshState,
     modifier: Modifier = Modifier,
     contentPadding: PaddingValues,
-    title: String = "Listen Now",
+    title: String,
     signedIn: Boolean = true,
     onSignIn: (() -> Unit)? = null,
     /**
@@ -90,6 +94,7 @@ fun HomeScreen(
     // Explore doesn't page — only Home has a continuation worth following.
     onLoadMore: (() -> Unit)? = null,
     loadingMore: Boolean = false,
+    recentlyPlayedLoading: Boolean = false,
 ) {
     PullToRefresh(
         refreshing = refreshing,
@@ -118,10 +123,19 @@ fun HomeScreen(
             when (state) {
                 is UiState.Loading -> feedSkeleton()
                 is UiState.Error -> item {
-                    MessageState(state.message, actionLabel = "Retry", onAction = onRetry)
+                    MessageState(state.message, actionLabel = stringResource(R.string.retry), onAction = onRetry)
                 }
                 is UiState.Success -> {
-                    itemsIndexedShelves(state.data, onItemClick, onItemLongPress)
+                    if (recentlyPlayedLoading) recentlyPlayedSkeleton()
+                    // The loading skeleton already owns the hero slot. Until
+                    // Recently Played lands, every real shelf must retain its
+                    // compact-card layout instead of briefly becoming a hero.
+                    itemsIndexedShelves(
+                        shelves = state.data,
+                        onItemClick = onItemClick,
+                        onItemLongPress = onItemLongPress,
+                        firstIsHero = !recentlyPlayedLoading,
+                    )
                     if (loadingMore) feedMoreSkeleton()
                 }
             }
@@ -154,10 +168,11 @@ private fun androidx.compose.foundation.lazy.LazyListScope.itemsIndexedShelves(
     shelves: List<HomeShelf>,
     onItemClick: (ShelfItem) -> Unit,
     onItemLongPress: ((ShelfItem) -> Unit)?,
+    firstIsHero: Boolean = true,
 ) {
     shelves.forEachIndexed { index, shelf ->
         item(key = shelf.title + index) {
-            if (index == 0) {
+            if (index == 0 && firstIsHero) {
                 HeroShelf(shelf = shelf, onItemClick = onItemClick, onItemLongPress = onItemLongPress)
             } else {
                 Shelf(shelf = shelf, onItemClick = onItemClick, onItemLongPress = onItemLongPress)
@@ -166,24 +181,47 @@ private fun androidx.compose.foundation.lazy.LazyListScope.itemsIndexedShelves(
     }
 }
 
-/** Shared by the home feed, Explore and Library so headings line up across tabs. */
+/**
+ * Shared by the home feed, Explore and Library so headings line up across tabs.
+ *
+ * [onShowAll] is only ever set on Library, whose rows stop at five cards
+ * rather than running the shelf's whole length — see [LibraryGridShelf].
+ * Home and Explore never pass it, so their heading is unchanged.
+ */
 @Composable
-internal fun SectionHeader(title: String, subtitle: String = "") {
-    Column(Modifier.padding(horizontal = PAGE_GUTTER, vertical = 10.dp)) {
-        Text(
-            text = title,
-            style = MaterialTheme.typography.headlineMedium,
-            color = MaterialTheme.colorScheme.onBackground,
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis,
-        )
-        if (subtitle.isNotBlank()) {
+internal fun SectionHeader(title: String, subtitle: String = "", onShowAll: (() -> Unit)? = null) {
+    Row(
+        modifier = Modifier
+            .padding(horizontal = PAGE_GUTTER, vertical = 10.dp)
+            .fillMaxWidth(),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Column(Modifier.weight(1f)) {
             Text(
-                text = subtitle,
-                style = MaterialTheme.typography.titleMedium,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                text = title,
+                style = MaterialTheme.typography.headlineMedium,
+                color = MaterialTheme.colorScheme.onBackground,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
+            )
+            if (subtitle.isNotBlank()) {
+                Text(
+                    text = subtitle,
+                    style = MaterialTheme.typography.titleMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+        }
+        if (onShowAll != null) {
+            Text(
+                text = stringResource(R.string.show_all),
+                style = MaterialTheme.typography.titleSmall,
+                color = MaterialTheme.colorScheme.primary,
+                modifier = Modifier
+                    .clickable(onClick = onShowAll)
+                    .padding(start = 12.dp, top = 4.dp, bottom = 4.dp),
             )
         }
     }
@@ -319,15 +357,14 @@ internal fun NewShelfCard(
     label: String,
     subtitle: String,
     onClick: () -> Unit,
+    modifier: Modifier = Modifier.width(SHELF_CARD_WIDTH),
 ) {
     Column(
-        modifier = Modifier
-            .width(SHELF_CARD_WIDTH)
-            .clickable(onClick = onClick),
+        modifier = modifier.clickable(onClick = onClick),
     ) {
         Box(
             modifier = Modifier
-                .width(SHELF_CARD_WIDTH)
+                .fillMaxWidth()
                 .aspectRatio(1f)
                 .clip(RoundedCornerShape(12.dp))
                 .background(MaterialTheme.colorScheme.surfaceVariant),
@@ -360,22 +397,23 @@ internal fun NewShelfCard(
 
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
-private fun ShelfCard(
+internal fun ShelfCard(
     item: ShelfItem,
     onClick: () -> Unit,
     onLongPress: (() -> Unit)? = null,
+    modifier: Modifier = Modifier.width(SHELF_CARD_WIDTH),
+    /** Set on a Library playlist card that's in [AppSettings.pinnedPlaylists][com.music.bitchord.data.settings.AppSettings.pinnedPlaylists]. */
+    isPinned: Boolean = false,
 ) {
     Column(
-        modifier = Modifier
-            .width(SHELF_CARD_WIDTH)
-            .combinedClickable(onClick = onClick, onLongClick = onLongPress),
+        modifier = modifier.combinedClickable(onClick = onClick, onLongClick = onLongPress),
     ) {
         when (item.browseId) {
             "local:downloads" -> {
                 val palette = remember { MeshPalette(listOf(Color(0xFF1E3C72), Color(0xFF2A5298))) }
                 Box(
                     modifier = Modifier
-                        .width(SHELF_CARD_WIDTH)
+                        .fillMaxWidth()
                         .aspectRatio(1f)
                         .clip(RoundedCornerShape(12.dp)),
                     contentAlignment = Alignment.Center,
@@ -398,7 +436,7 @@ private fun ShelfCard(
                 val palette = remember { MeshPalette(listOf(Color(0xFF134E5E), Color(0xFF71B280))) }
                 Box(
                     modifier = Modifier
-                        .width(SHELF_CARD_WIDTH)
+                        .fillMaxWidth()
                         .aspectRatio(1f)
                         .clip(RoundedCornerShape(12.dp)),
                     contentAlignment = Alignment.Center,
@@ -423,7 +461,7 @@ private fun ShelfCard(
                     contentDescription = null,
                     contentScale = androidx.compose.ui.layout.ContentScale.Crop,
                     modifier = Modifier
-                        .width(SHELF_CARD_WIDTH)
+                        .fillMaxWidth()
                         .aspectRatio(1f)
                         .clip(RoundedCornerShape(12.dp))
                         .thumbnailBorder(RoundedCornerShape(12.dp))
@@ -432,13 +470,28 @@ private fun ShelfCard(
             }
         }
         Spacer(Modifier.height(10.dp))
-        Text(
-            text = item.title,
-            style = MaterialTheme.typography.titleMedium,
-            color = MaterialTheme.colorScheme.onBackground,
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis,
-        )
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            if (isPinned) {
+                Icon(
+                    imageVector = BitChordIcons.Pin,
+                    contentDescription = stringResource(R.string.pinned),
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.size(14.dp),
+                )
+                Spacer(Modifier.width(4.dp))
+            }
+            Text(
+                text = item.title,
+                style = MaterialTheme.typography.titleMedium,
+                color = MaterialTheme.colorScheme.onBackground,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.weight(1f, fill = false),
+            )
+        }
         Text(
             text = item.subtitle,
             style = MaterialTheme.typography.bodyMedium,

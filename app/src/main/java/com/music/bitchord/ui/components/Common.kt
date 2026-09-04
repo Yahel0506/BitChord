@@ -4,9 +4,13 @@ import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
+import androidx.compose.animation.animateColorAsState
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.DownloadDone
+import androidx.compose.material.icons.rounded.CheckCircle
+import androidx.compose.material.icons.rounded.GraphicEq
 import androidx.compose.material.icons.rounded.MoreVert
+import androidx.compose.material.icons.rounded.PlayArrow
 import androidx.compose.material.icons.rounded.PlaylistAdd
 import androidx.compose.material.icons.rounded.PlaylistPlay
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -53,12 +57,15 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.drawWithContent
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.graphics.drawscope.clipRect
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import coil3.compose.AsyncImage
+import com.music.bitchord.R
 import com.music.bitchord.data.model.ROW_ART_PX
 import com.music.bitchord.data.model.Song
 import com.music.bitchord.data.model.artworkAt
@@ -113,6 +120,37 @@ val FLOATING_BAR_MAX_WIDTH = 440.dp
  */
 val SHELF_CARD_WIDTH = 150.dp
 
+/** A song title with the catalogue-standard outlined E for explicit audio. */
+@Composable
+fun ExplicitSongTitle(
+    song: Song,
+    style: TextStyle,
+    color: Color,
+    modifier: Modifier = Modifier,
+) {
+    Row(modifier = modifier, verticalAlignment = Alignment.CenterVertically) {
+        if (song.isExplicit == true) {
+            Text(
+                text = "E",
+                style = MaterialTheme.typography.labelSmall,
+                color = color,
+                modifier = Modifier
+                    .border(1.dp, color.copy(alpha = 0.72f), RoundedCornerShape(2.dp))
+                    .padding(horizontal = 3.dp),
+            )
+            Spacer(Modifier.width(6.dp))
+        }
+        Text(
+            text = song.title,
+            style = style,
+            color = color,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            modifier = Modifier.weight(1f),
+        )
+    }
+}
+
 /** Share of the row a lead-shelf card takes, so the next one peeks in past it. */
 private const val HERO_CARD_FRACTION = 0.70f
 
@@ -144,6 +182,45 @@ const val HERO_CARD_RATIO = 0.92f
  * width.
  */
 fun heroCardWidth(available: Dp): Dp = minOf(available * HERO_CARD_FRACTION, HERO_CARD_MAX_WIDTH)
+
+/** How many cards sit across a library grid row, and how wide each lands. */
+data class LibraryGridSpec(val columns: Int, val cardWidth: Dp)
+
+/** The narrowest a library grid card is let get before another column gives way. */
+private val LIBRARY_GRID_MIN_CARD_WIDTH = 84.dp
+
+/** Gap between cards in a library grid, in both directions. */
+val LIBRARY_GRID_SPACING = 12.dp
+
+private const val LIBRARY_GRID_MIN_COLUMNS = 2
+
+/** Library shelves never grow past this many across, however wide the screen. */
+private const val LIBRARY_GRID_MAX_COLUMNS = 5
+
+/**
+ * How a Library shelf's full "Show all" page lays out as a grid, in
+ * [available] dp of row — see `LibraryGridPage`.
+ *
+ * Columns follow from [LIBRARY_GRID_MIN_CARD_WIDTH] — as many as fit — rather
+ * than from a fixed count, so a phone settles on 3 or 4 and a tablet fills out
+ * to the 5-column ceiling. Every width here is already in dp, which is what
+ * makes this "based on device width and dpi" rather than a raw pixel count: a
+ * dp reads the same physical size on a 420ppi phone as on a 160ppi tablet, so
+ * the column count tracks how much room there actually is rather than how
+ * many pixels the panel happens to report.
+ *
+ * The shelf's own preview row on the Library page itself is unrelated — it
+ * keeps the fixed [SHELF_CARD_WIDTH] every other shelf uses and a flat
+ * five-card cap rather than a width-derived one, so a card is the same size
+ * whether the row it's in scrolls or not. See `LibraryGridShelf`.
+ */
+fun libraryGrid(available: Dp): LibraryGridSpec {
+    val raw = ((available + LIBRARY_GRID_SPACING) / (LIBRARY_GRID_MIN_CARD_WIDTH + LIBRARY_GRID_SPACING))
+        .toInt()
+    val columns = raw.coerceIn(LIBRARY_GRID_MIN_COLUMNS, LIBRARY_GRID_MAX_COLUMNS)
+    val cardWidth = (available - LIBRARY_GRID_SPACING * (columns - 1)) / columns
+    return LibraryGridSpec(columns, cardWidth)
+}
 
 /**
  * One track row, used by search, library and detail pages.
@@ -193,6 +270,14 @@ fun SongRow(
      * kind of thing that reads as pasted on.
      */
     downloadedTint: Color? = MaterialTheme.colorScheme.primary,
+    /** Whether this row is the current item in the player's queue. */
+    isCurrent: Boolean = false,
+    /** Distinguishes active playback from the same current item while paused. */
+    isPlaying: Boolean = false,
+    /** Accent supplied by artwork-tinted pages. */
+    activeTint: Color = MaterialTheme.colorScheme.primary,
+    /** True while a Downloads row belongs to the current multi-selection. */
+    selected: Boolean = false,
 ) {
     val haptics = rememberHaptics()
     val swipeStateHolder = remember { mutableStateOf<SwipeToDismissBoxState?>(null) }
@@ -215,7 +300,19 @@ fun SongRow(
     swipeStateHolder.value = swipeState
 
     if (onSwipeToQueue == null) {
-        SongRowContent(song, onClick, onLongPress, modifier, trackNumber, subtitleColor, downloadedTint)
+        SongRowContent(
+            song = song,
+            onClick = onClick,
+            onLongPress = onLongPress,
+            modifier = modifier,
+            trackNumber = trackNumber,
+            subtitleColor = subtitleColor,
+            downloadedTint = downloadedTint,
+            isCurrent = isCurrent,
+            isPlaying = isPlaying,
+            activeTint = activeTint,
+            selected = selected,
+        )
         return
     }
 
@@ -256,6 +353,10 @@ fun SongRow(
             trackNumber = trackNumber,
             subtitleColor = subtitleColor,
             downloadedTint = downloadedTint,
+            isCurrent = isCurrent,
+            isPlaying = isPlaying,
+            activeTint = activeTint,
+            selected = selected,
         )
     }
 }
@@ -300,7 +401,7 @@ private fun QueueSwipeLabel(playNext: Boolean) {
         )
         Spacer(Modifier.width(6.dp))
         Text(
-            text = if (playNext) "Play next" else "Queue",
+            text = stringResource(if (playNext) R.string.play_next else R.string.queue),
             style = MaterialTheme.typography.labelMedium,
             color = MaterialTheme.colorScheme.primary,
         )
@@ -317,10 +418,23 @@ private fun SongRowContent(
     trackNumber: Int? = null,
     subtitleColor: Color = MaterialTheme.colorScheme.onSurfaceVariant,
     downloadedTint: Color? = MaterialTheme.colorScheme.primary,
+    isCurrent: Boolean = false,
+    isPlaying: Boolean = false,
+    activeTint: Color = MaterialTheme.colorScheme.primary,
+    selected: Boolean = false,
 ) {
+    val titleColor by animateColorAsState(
+        targetValue = if (isCurrent) activeTint else MaterialTheme.colorScheme.onBackground,
+        label = "song row title",
+    )
+    val activeBackground by animateColorAsState(
+        targetValue = if (isCurrent || selected) activeTint.copy(alpha = 0.14f) else Color.Transparent,
+        label = "song row background",
+    )
     Row(
         modifier = modifier
             .fillMaxWidth()
+            .background(activeBackground)
             .combinedClickable(onClick = onClick, onLongClick = onLongPress)
             .padding(horizontal = PAGE_GUTTER, vertical = 4.dp),
         verticalAlignment = Alignment.CenterVertically,
@@ -329,11 +443,20 @@ private fun SongRowContent(
             // Same 52dp the artwork would take, so a numbered list and an
             // illustrated one share a left edge and a divider inset.
             Box(Modifier.size(52.dp), contentAlignment = Alignment.Center) {
-                Text(
-                    text = "$trackNumber",
-                    style = MaterialTheme.typography.bodyLarge,
-                    color = subtitleColor,
-                )
+                if (isCurrent) {
+                    Icon(
+                        imageVector = if (isPlaying) Icons.Rounded.GraphicEq else Icons.Rounded.PlayArrow,
+                        contentDescription = stringResource(R.string.now_playing),
+                        tint = activeTint,
+                        modifier = Modifier.size(22.dp),
+                    )
+                } else {
+                    Text(
+                        text = "$trackNumber",
+                        style = MaterialTheme.typography.bodyLarge,
+                        color = subtitleColor,
+                    )
+                }
             }
         } else {
             AsyncImage(
@@ -348,16 +471,17 @@ private fun SongRowContent(
         }
         Spacer(Modifier.width(14.dp))
         Column(Modifier.weight(1f)) {
-            Text(
-                text = song.title,
+            ExplicitSongTitle(
+                song = song,
                 style = MaterialTheme.typography.titleMedium,
-                color = MaterialTheme.colorScheme.onBackground,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
+                color = titleColor,
             )
             Spacer(Modifier.height(2.dp))
             Text(
-                text = song.artist,
+                text = listOfNotNull(
+                    song.artist.takeIf { it.isNotBlank() },
+                    song.downloadFormat,
+                ).joinToString(" · "),
                 style = MaterialTheme.typography.bodyMedium,
                 color = subtitleColor,
                 maxLines = 1,
@@ -366,6 +490,24 @@ private fun SongRowContent(
         }
         if (downloadedTint != null) {
             DownloadedBadge(song.videoId, downloadedTint)
+        }
+        if (selected) {
+            Spacer(Modifier.width(8.dp))
+            Icon(
+                Icons.Rounded.CheckCircle,
+                contentDescription = stringResource(R.string.selected),
+                tint = activeTint,
+                modifier = Modifier.size(20.dp),
+            )
+        }
+        if (isCurrent && trackNumber == null) {
+            Spacer(Modifier.width(8.dp))
+            Icon(
+                imageVector = if (isPlaying) Icons.Rounded.GraphicEq else Icons.Rounded.PlayArrow,
+                contentDescription = stringResource(R.string.now_playing),
+                tint = activeTint,
+                modifier = Modifier.size(20.dp),
+            )
         }
         song.durationText?.let {
             Spacer(Modifier.width(8.dp))
@@ -386,7 +528,7 @@ private fun SongRowContent(
             ) {
                 Icon(
                     Icons.Rounded.MoreVert,
-                    contentDescription = "More",
+                    contentDescription = stringResource(R.string.more),
                     tint = MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.size(20.dp),
                 )
@@ -415,7 +557,7 @@ fun DownloadedBadge(videoId: String, tint: Color, modifier: Modifier = Modifier)
     Spacer(Modifier.width(8.dp))
     Icon(
         Icons.Rounded.DownloadDone,
-        contentDescription = "Downloaded",
+        contentDescription = stringResource(R.string.downloaded),
         tint = tint,
         modifier = modifier.size(16.dp),
     )
@@ -465,12 +607,12 @@ fun SignInBanner(onSignIn: () -> Unit, modifier: Modifier = Modifier) {
     ) {
         Column(Modifier.weight(1f)) {
             Text(
-                text = "Sign in to YouTube Music",
+                text = stringResource(R.string.sign_in_youtube_music),
                 style = MaterialTheme.typography.titleMedium,
                 color = MaterialTheme.colorScheme.onSurface,
             )
             Text(
-                text = "Get personalized recommendations for you",
+                text = stringResource(R.string.personalized_recommendations),
                 style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 maxLines = 1,
@@ -478,7 +620,7 @@ fun SignInBanner(onSignIn: () -> Unit, modifier: Modifier = Modifier) {
             )
         }
         Spacer(Modifier.width(12.dp))
-        Button(onClick = onSignIn) { Text("Sign in") }
+        Button(onClick = onSignIn) { Text(stringResource(R.string.sign_in)) }
     }
 }
 

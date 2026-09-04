@@ -8,10 +8,12 @@ import android.os.Build
 import android.os.Environment
 import android.provider.MediaStore
 import com.music.bitchord.data.DebugLog as Log
+import com.music.bitchord.data.settings.AppSettings
 import androidx.annotation.RequiresApi
 import com.music.bitchord.data.model.Song
 import java.io.File
 import java.io.OutputStream
+import java.util.Locale
 
 /**
  * Where a downloaded track goes, and how it gets there.
@@ -133,10 +135,10 @@ object DownloadStore {
      * concerned — the tagger works on the box tree and never asks what the
      * samples inside are.
      */
-    fun storable(codec: String?): Storable? = when (codec?.lowercase()?.trim()) {
+    fun storable(codec: String?): Storable? = when (codec?.lowercase(Locale.ROOT)?.trim()) {
         "flac", "x-flac" -> Storable("flac", "audio/flac")
         "wav", "x-wav", "wave" -> Storable("wav", "audio/x-wav")
-        "alac", "m4a", "mp4" -> Storable("m4a", "audio/mp4")
+        "alac", "m4a", "mp4", "eac3-joc", "ec3-joc", "dolby-atmos" -> Storable("m4a", "audio/mp4")
         else -> null
     }
 
@@ -151,7 +153,9 @@ object DownloadStore {
      * have one.
      */
     fun existing(context: Context, name: String): Uri? =
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+        if (!AppSettings.exportDownloads.value) {
+            privateFile(context, name).takeIf { it.exists() }?.let(Uri::fromFile)
+        } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             mediaStoreEntry(context, name)
         } else {
             legacyFile(name).takeIf { it.exists() }?.let(Uri::fromFile)
@@ -206,7 +210,12 @@ object DownloadStore {
 
     fun delete(context: Context, uri: Uri): Boolean = runCatching {
         if (uri.scheme == "file") {
-            uri.path?.let { File(it).delete() } == true
+            uri.path?.let { path ->
+                val file = File(path)
+                if (file.name == "playlist.m3u8" && file.parentFile?.parentFile?.name == "offline-hls") {
+                    file.parentFile?.deleteRecursively() == true
+                } else file.delete()
+            } == true
         } else {
             context.contentResolver.delete(uri, null, null) > 0
         }
@@ -230,6 +239,9 @@ object DownloadStore {
         /** Set on the legacy path only: what [part] is renamed to. */
         private val target: File?,
     ) {
+        /** The bytes being built, whether this is a MediaStore row or a legacy `.part` file. */
+        val tagUri: Uri get() = part?.let(Uri::fromFile) ?: uri
+
         fun openStream(): OutputStream =
             part?.outputStream()
                 ?: context.contentResolver.openOutputStream(uri)
@@ -272,6 +284,14 @@ object DownloadStore {
      *   download cannot start rather than that it might not finish.
      */
     fun begin(context: Context, name: String, mimeType: String): Pending {
+        if (!AppSettings.exportDownloads.value) {
+            val target = privateFile(context, name)
+            val folder = target.parentFile ?: error("No download folder")
+            if (!folder.exists() && !folder.mkdirs()) error("Could not create ${folder.path}")
+            val part = File(folder, ".$name.part")
+            part.delete()
+            return Pending(context, Uri.fromFile(target), name, part = part, target = target)
+        }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             val values = ContentValues().apply {
                 put(MediaStore.MediaColumns.DISPLAY_NAME, name)
@@ -308,4 +328,7 @@ object DownloadStore {
         File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_MUSIC), FOLDER),
         name,
     )
+
+    private fun privateFile(context: Context, name: String) =
+        File(File(context.filesDir, "downloads"), name)
 }

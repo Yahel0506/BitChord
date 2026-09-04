@@ -12,8 +12,8 @@ import coil3.memory.MemoryCache
 import coil3.request.crossfade
 import com.music.bitchord.auth.AuthStore
 import com.music.bitchord.data.canvas.CanvasCache
+import com.music.bitchord.data.canvas.SpotifyToken
 import com.music.bitchord.playback.AudioCache
-import com.music.bitchord.playback.DolbyAtmos
 import com.music.bitchord.playback.LastPlayed
 import com.music.bitchord.data.innertube.Innertube
 import com.music.bitchord.data.scrobbling.LastFM
@@ -35,22 +35,28 @@ class BitChordApplication : Application(), SingletonImageLoader.Factory {
         // PlaybackService shares this process, so seeding the cookie here means
         // stream resolution is authenticated from the first play onwards.
         authStore = AuthStore(this)
-        Innertube.cookie = authStore.cookie
+        // Migration-safe: an old single cookie becomes the first encrypted
+        // session, while newer installs restore the profile the listener chose.
+        val restoredSession = authStore.activeSession
+        if (restoredSession != null && authStore.activeAccountId == null) {
+            authStore.select(restoredSession.accountId, restoredSession.activeProfileId)
+        }
+        authStore.cookie = restoredSession?.cookie
+        Innertube.cookie = restoredSession?.cookie
         // Which account that cookie actually acts as. Read here rather than on
         // demand so the answer is usually in hand before the first request needs
         // it: a play registered under the wrong account is indistinguishable, to
         // the listener, from one that was never registered at all. Fire and
         // forget — every caller works without it, just less precisely.
-        if (authStore.cookie != null) {
+        if (restoredSession != null) {
+            // After the cookie, never before: setting the cookie clears any
+            // channel the last session was acting as, so restoring the choice
+            // first would restore it into the value about to be wiped.
+            restoredSession.profiles.firstOrNull { it.profileId == restoredSession.activeProfileId }
+                ?.let { Innertube.selectChannel(it.pageId, it.dataSyncId, it.authUser) }
             CoroutineScope(Dispatchers.IO).launch { Innertube.ensureSessionScope() }
         }
         AppSettings.init(this)
-        // After AppSettings: a device with Atmos switched off retires the
-        // spatial audio preference on the spot, and that needs prefs open.
-        DolbyAtmos.init(this)
-        // Before LastPlayed: a restored queue can contain source-backed tracks,
-        // and turning one of those back into a playable item needs the registry
-        // that knows which source it belongs to.
         SourceRegistry.init(this)
         SearchHistory.init(this)
         LastPlayed.init(this)
@@ -72,6 +78,11 @@ class BitChordApplication : Application(), SingletonImageLoader.Factory {
         // exists at all — it is the fix for canvas clips re-fetching the same
         // few seconds of video from the network on every loop.
         CanvasCache.init(this)
+        // The offscreen WebView that mints a Spotify access token from the
+        // listener's own session cookie needs a Context, and nothing in the
+        // suspend call chain that reaches it (a track's canvas lookup) has
+        // one to hand — see SpotifyToken's doc for why.
+        SpotifyToken.init(this)
         // A sideloaded update is just a new APK over the old one, so app data —
         // including whatever the old build left in these caches — survives it
         // untouched. Wipe both on the first launch of a higher versionCode so a

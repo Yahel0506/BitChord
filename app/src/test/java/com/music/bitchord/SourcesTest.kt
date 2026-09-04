@@ -1,17 +1,28 @@
 package com.music.bitchord
 
 import com.music.bitchord.data.NerdStats
+import com.music.bitchord.data.jiosaavn.RawSongItem
+import com.music.bitchord.data.jiosaavn.prioritizeExplicit
 import com.music.bitchord.data.model.Song
 import com.music.bitchord.data.sources.ModuleSource
+import com.music.bitchord.data.sources.MusicSource
+import com.music.bitchord.data.sources.SourceHealth
+import com.music.bitchord.data.sources.SourceKind
 import com.music.bitchord.data.sources.SourceRegistry
 import com.music.bitchord.data.sources.SourceResolver
+import com.music.bitchord.data.sources.SourceStream
 import com.music.bitchord.data.sources.StreamFormat
+import com.music.bitchord.data.sources.StreamRequest
 import com.music.bitchord.data.sources.TrackMatcher
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import kotlin.system.measureTimeMillis
 
 /**
  * The parts of the source layer that can be wrong quietly.
@@ -21,6 +32,12 @@ import org.junit.Test
  * error, it plays a different recording under the right title.
  */
 class SourcesTest {
+
+    private companion object {
+        /** What the raced fakes below all claim to hold, so the matcher accepts them. */
+        const val RACE_TITLE = "Paniyon Sa"
+        const val RACE_ARTIST = "Atif Aslam"
+    }
 
     // ---- Track identity -----------------------------------------------------
 
@@ -65,6 +82,15 @@ class SourcesTest {
         assertEquals("MP3 · 44.1 kHz · 320 kbps", lossy.summary)
 
         assertEquals("Unknown format", StreamFormat().summary)
+    }
+
+    @Test
+    fun `Dolby Atmos is a distinct premium codec`() {
+        val atmos = StreamFormat(codec = "eac3-joc")
+        assertTrue(atmos.isDolbyAtmos)
+        assertEquals(false, atmos.isLossless)
+        assertEquals("Dolby Atmos", atmos.summary)
+        assertTrue(SourceResolver.worthSwapping(atmos, StreamFormat(codec = "aac", kbps = 332)))
     }
 
     /**
@@ -360,6 +386,221 @@ class SourcesTest {
     }
 
     /**
+     * JioSaavn currently lists these as the same title and artist even though
+     * they are different recordings. The requested release must beat the row
+     * whose runtime happens to be closer.
+     */
+    @Test
+    fun `uses the album to separate duplicate JioSaavn recordings`() {
+        val target = TrackMatcher.Target(
+            "Brown Rang",
+            "Yo Yo Honey Singh",
+            durationSec = 175,
+            album = "International Villager",
+        )
+        val wanted = song("Brown Rang", "Yo Yo Honey Singh", duration = "2:59")
+            .copy(albumName = "International Villager")
+        val wrongButCloser = song("Brown Rang", "Yo Yo Honey Singh", duration = "2:54")
+            .copy(albumName = "Chaar Ikke")
+
+        assertEquals(wanted, TrackMatcher.best(listOf(wrongButCloser, wanted), target))
+    }
+
+    @Test
+    fun `detects conflicting releases when the requested album is unknown`() {
+        val target = TrackMatcher.Target("Brown Rang", "Yo Yo Honey Singh", durationSec = 175)
+        val internationalVillager = song("Brown Rang", "Yo Yo Honey Singh", "2:59")
+            .copy(albumName = "International Villager")
+        val chaarIkke = song("Brown Rang", "Yo Yo Honey Singh", "2:54")
+            .copy(albumName = "Chaar Ikke")
+
+        assertTrue(
+            TrackMatcher.hasConflictingAlbums(
+                listOf(internationalVillager, chaarIkke),
+                target,
+            ),
+        )
+        assertFalse(
+            TrackMatcher.hasConflictingAlbums(
+                listOf(
+                    internationalVillager,
+                    internationalVillager.copy(albumName = "International Villager (Deluxe Edition)"),
+                ),
+                target,
+            ),
+        )
+        assertFalse(
+            TrackMatcher.hasConflictingAlbums(
+                listOf(internationalVillager, chaarIkke),
+                target.copy(album = "International Villager"),
+            ),
+        )
+    }
+
+    @Test
+    fun `uses the uniquely fullest credit to resolve a JioSaavn release collision`() {
+        val target = TrackMatcher.Target("Ek Dil Ek Jaan", "Shivam Pathak", durationSec = 220)
+        val original = song(
+            "Ek Dil Ek Jaan",
+            "Shivam Pathak, Mujtaba Aziz Naza, Kunal Pandit, Farhan Sabri",
+            "3:40",
+        ).copy(albumName = "Padmaavat")
+        val compilation = song("Ek Dil Ek Jaan", "Shivam Pathak", "3:39")
+            .copy(albumName = "Top 20 - Romantic Songs 2018")
+        val fromCompilation = song(
+            "Ek Dil Ek Jaan (From Padmaavat)",
+            "Shivam Pathak, Sanjay Leela Bhansali, A.M. Turaz",
+            "3:39",
+        ).copy(albumName = "Bollywood Magic Mix")
+
+        assertEquals(
+            original,
+            TrackMatcher.uniquelyMostCreditedCloseMatch(
+                listOf(original, compilation, fromCompilation),
+                target,
+            ),
+        )
+    }
+
+    @Test
+    fun `retains JioSaavn refusal when conflicting releases tie on credit coverage`() {
+        val target = TrackMatcher.Target("Mere Bina", "Pritam, Nikhil D'Souza", durationSec = 290)
+        val first = song("Mere Bina", "Pritam, Nikhil D'Souza", "4:49").copy(albumName = "Crook")
+        val second = song("Mere Bina", "Pritam, Nikhil D'Souza", "4:51").copy(albumName = "Sad Love Hits")
+
+        assertNull(TrackMatcher.uniquelyMostCreditedCloseMatch(listOf(first, second), target))
+    }
+
+    @Test
+    fun `target keeps the queued album identity`() {
+        val queued = song("Brown Rang", "Yo Yo Honey Singh", "2:59")
+            .copy(albumName = "International Villager")
+        assertEquals("International Villager", TrackMatcher.targetOf(queued).album)
+    }
+
+    @Test
+    fun `JioSaavn prioritizes the uncensored duplicate`() {
+        val clean = RawSongItem(id = "clean", title = "Starboy", explicitContent = "0")
+        val explicit = RawSongItem(id = "explicit", title = "Starboy", explicitContent = "1")
+        val anotherClean = RawSongItem(id = "clean-2", title = "Starboy", explicitContent = "0")
+
+        assertEquals(
+            listOf("explicit", "clean", "clean-2"),
+            prioritizeExplicit(listOf(clean, explicit, anotherClean)).map { it.id },
+        )
+    }
+
+    @Test
+    fun `JioSaavn accepts textual explicit flags defensively`() {
+        assertTrue(RawSongItem(explicitContent = "true").isExplicit)
+        assertFalse(RawSongItem(explicitContent = "false").isExplicit)
+        assertFalse(RawSongItem(explicitContent = "").isExplicit)
+    }
+
+    @Test
+    fun `explicit YouTube track cannot match the censored JioSaavn edition`() {
+        val target = TrackMatcher.Target(
+            "Starboy",
+            "The Weeknd",
+            durationSec = 230,
+            album = "Starboy",
+            isExplicit = true,
+        )
+        val clean = song("Starboy", "The Weeknd", "3:50")
+            .copy(albumName = "Starboy", isExplicit = false)
+        val uncensored = clean.copy(videoId = "uncensored", isExplicit = true)
+
+        assertEquals(uncensored, TrackMatcher.best(listOf(clean, uncensored), target))
+        assertNull(TrackMatcher.score(clean, target))
+    }
+
+    @Test
+    fun `unknown YouTube explicit state does not reject the credited JioSaavn track`() {
+        val target = TrackMatcher.Target(
+            "For A Reason",
+            "Karan Aujla, IKKY",
+            durationSec = 180,
+            isExplicit = null,
+        )
+        val wanted = song(
+            "For A Reason",
+            "Karan Aujla, IKKY, Ikwinder Sahota, Milan D'Agostini",
+            "3:00",
+        ).copy(videoId = "vLSaC03b", albumName = "P-POP CULTURE", isExplicit = true)
+        val remix = song("For A Reason", "Aye Manny", "3:00")
+            .copy(videoId = "sN24LH3L", albumName = "For A Reason (Remix)", isExplicit = false)
+
+        assertEquals(wanted, TrackMatcher.best(listOf(remix, wanted), target))
+        assertEquals(listOf(wanted), TrackMatcher.ranked(listOf(remix, wanted), target))
+    }
+
+    @Test
+    fun `missing YouTube badge does not reject explicit I Really Do`() {
+        val target = TrackMatcher.Target(
+            "I Really Do...",
+            "Karan Aujla",
+            durationSec = 193,
+            isExplicit = null,
+        )
+        val wanted = song(
+            "I Really Do...",
+            "Karan Aujla, IKKY, Ikwinder Sahota, Jamal Europe",
+            "3:13",
+        ).copy(videoId = "1vja2Ptl", albumName = "P-POP CULTURE", isExplicit = true)
+        val otherSong = song("I Really Do...", "Arjun Viraat, Shefali Alvares", "3:02")
+            .copy(videoId = "WeCT149y", albumName = "I Really Do...", isExplicit = false)
+
+        assertEquals(wanted, TrackMatcher.best(listOf(otherSong, wanted), target))
+    }
+
+    @Test
+    fun `unlabelled music video timing cannot make another artist the Brown Rang match`() {
+        val target = TrackMatcher.Target(
+            "Brown Rang",
+            "Yo Yo Honey Singh",
+            durationSec = 211,
+            // This is the phone's real failure: YouTube presented the official
+            // video as a song row, so the explicit video flag was false.
+            isVideo = false,
+        )
+        val wantedAudio = song("Brown Rang", "Yo Yo Honey Singh", "2:59")
+            .copy(videoId = "vj2tW1iy", albumName = "International Villager")
+        val wrongExactRuntime = song("Brown Rang", "Lovely, Jais Rikhi, Love Sagar", "3:30")
+            .copy(videoId = "UgOpg53G", albumName = "Brown Rang")
+
+        assertEquals(wantedAudio, TrackMatcher.best(listOf(wrongExactRuntime, wantedAudio), target))
+        assertEquals(
+            listOf(wantedAudio),
+            TrackMatcher.ranked(listOf(wrongExactRuntime, wantedAudio), target),
+        )
+        assertFalse(TrackMatcher.hasConflictingAlbums(listOf(wantedAudio), target))
+    }
+
+    @Test
+    fun `manual video audio switch accepts the official song despite a long visual intro`() {
+        val target = TrackMatcher.Target(
+            "Big Dawgs",
+            "Hanumankind, Kalmi",
+            // A visual short film can be much longer than its song release.
+            durationSec = 391,
+            isVideo = true,
+        )
+        val officialAudio = song("Big Dawgs", "Hanumankind, Kalmi", "3:11")
+            .copy(videoId = "official-audio")
+        val sameTitleCover = song("Big Dawgs", "Unrelated Cover Artist", "6:31")
+            .copy(videoId = "cover")
+
+        // The ordinary source matcher is right to refuse a multi-minute gap;
+        // the explicit video-to-audio action is allowed to use YTM's official
+        // song row after title, version and artist all agree.
+        assertNull(TrackMatcher.best(listOf(officialAudio, sameTitleCover), target))
+        assertEquals(
+            officialAudio,
+            TrackMatcher.bestOfficialAudioForVideo(listOf(sameTitleCover, officialAudio), target),
+        )
+    }
+
+    /**
      * A declared tier is a reason to prefer one copy of a recording over
      * another. It is not a reason to play a different recording — the DJ edit
      * on a compilation carries the right title and the right artist, and only
@@ -456,11 +697,370 @@ class SourcesTest {
         )
     }
 
+    // ---- Ranking two copies of the same recording ---------------------------
+
+    /**
+     * The '9:45' case, reduced to the comparison at the heart of it: a module
+     * ranked above JioSaavn offered 128kbps and JioSaavn held 320kbps, and the
+     * walk has to be able to say which of those it would rather have.
+     *
+     * Note this is a different question from [SourceResolver.worthSwapping] —
+     * that one asks whether a difference earns a break in the audio, this one
+     * only asks which is better.
+     */
+    @Test
+    fun `ranks a higher-bitrate lossy stream above a lower one`() {
+        assertTrue(
+            SourceResolver.isBetter(
+                StreamFormat(codec = "mp4", kbps = 320),
+                StreamFormat(codec = "mp3", kbps = 128),
+            ),
+        )
+        assertFalse(
+            SourceResolver.isBetter(
+                StreamFormat(codec = "mp3", kbps = 128),
+                StreamFormat(codec = "mp4", kbps = 320),
+            ),
+        )
+    }
+
+    /** Codec decides before bitrate: no lossy rendition outranks a lossless one. */
+    @Test
+    fun `ranks lossless above any lossy bitrate`() {
+        assertTrue(
+            SourceResolver.isBetter(
+                StreamFormat(codec = "flac"),
+                StreamFormat(codec = "mp4", kbps = 320),
+            ),
+        )
+        assertFalse(
+            SourceResolver.isBetter(
+                StreamFormat(codec = "mp4", kbps = 320),
+                StreamFormat(codec = "flac"),
+            ),
+        )
+    }
+
+    /**
+     * Nothing to compare against is beaten by anything — this is what makes the
+     * first source's answer the floor rather than a special case.
+     */
+    @Test
+    fun `anything beats no stream at all`() {
+        assertTrue(SourceResolver.isBetter(StreamFormat(codec = "mp3", kbps = 128), null))
+    }
+
+    /**
+     * An equal stream does not displace the one already held. The walk asks
+     * sources in rank order, so a tie has to leave the higher-ranked source's
+     * copy in place rather than drifting to whoever answered last.
+     */
+    @Test
+    fun `an equal stream does not displace the one already held`() {
+        assertFalse(
+            SourceResolver.isBetter(
+                StreamFormat(codec = "mp4", kbps = 320),
+                StreamFormat(codec = "aac", kbps = 320),
+            ),
+        )
+        assertFalse(
+            SourceResolver.isBetter(StreamFormat(codec = "flac"), StreamFormat(codec = "alac")),
+        )
+    }
+
+    /**
+     * An unstated bitrate ranks as nothing rather than as a win. A source that
+     * declines to describe its stream should not be able to displace one that
+     * has stated a good rate — see [StreamFormat] on why null means "not
+     * stated" and is never inferred.
+     */
+    @Test
+    fun `an undescribed lossy stream does not outrank a stated one`() {
+        assertFalse(
+            SourceResolver.isBetter(StreamFormat(codec = "aac"), StreamFormat(codec = "mp4", kbps = 320)),
+        )
+        assertTrue(
+            SourceResolver.isBetter(StreamFormat(codec = "mp4", kbps = 320), StreamFormat(codec = "aac")),
+        )
+    }
+
     @Test
     fun `has nothing to offer when no candidate is the recording`() {
         val target = TrackMatcher.Target("Paniyon Sa", "Atif Aslam")
         assertNull(TrackMatcher.best(listOf(song("Paniyon Sa", "Some Cover Band")), target))
         assertNull(TrackMatcher.best(emptyList(), target))
+    }
+
+    // ---- What a lossy source has to beat to become a file -------------------
+
+    /**
+     * The case the floor exists for: JioSaavn's top rendition is better than
+     * anything YouTube's AAC ladder holds, so a download takes it rather than
+     * filing a copy worse than the one that would have been streamed.
+     */
+    @Test
+    fun `a 320 from a source is worth keeping over youtube's aac`() {
+        assertTrue(SourceResolver.beatsYouTubeAac(StreamFormat(codec = "mp4", kbps = 320)))
+    }
+
+    /**
+     * Below the top of YouTube's own ladder, a source's copy is trading one
+     * lossy file for another and giving up the more reliable fetch to do it —
+     * including at 256, where the two are a wash and the tie goes to YouTube.
+     */
+    @Test
+    fun `a thinner rendition loses to youtube's aac`() {
+        assertFalse(SourceResolver.beatsYouTubeAac(StreamFormat(codec = "mp3", kbps = 128)))
+        assertFalse(SourceResolver.beatsYouTubeAac(StreamFormat(codec = "mp4", kbps = 160)))
+        assertFalse(SourceResolver.beatsYouTubeAac(StreamFormat(codec = "aac", kbps = 256)))
+    }
+
+    /**
+     * A download has to name the file before the first byte lands, so a source
+     * that described its rendition as nothing has said nothing worth keeping —
+     * unlike playback, which can hand the URL to the decoder and find out.
+     */
+    @Test
+    fun `an unstated rendition is not worth keeping`() {
+        assertFalse(SourceResolver.beatsYouTubeAac(StreamFormat()))
+        assertFalse(SourceResolver.beatsYouTubeAac(StreamFormat(codec = "mp4")))
+    }
+
+    // ---- Which sources are worth asking before a track is played ------------
+
+    /**
+     * Read-ahead resolves the track *after* the one playing, so a source that
+     * needs ten seconds to answer is usually still answering when the listener
+     * arrives — and a wasted module resolve costs a QuickJS engine and several
+     * backend searches, where a wasted JioSaavn one costs a round trip. Only
+     * JioSaavn earns the speculative ask.
+     */
+    @Test
+    fun `only the quick source is worth resolving ahead of playback`() {
+        assertTrue(SourceKind.JIOSAAVN.worthPrefetching)
+        assertFalse(SourceKind.MODULE.worthPrefetching)
+        assertFalse(SourceKind.CUSTOM_MODULE.worthPrefetching)
+    }
+
+    /**
+     * YouTube is warmed ahead of time too, but through its own read-ahead,
+     * which speaks video ids and needs no cross-source match. Marking it here
+     * would send it through the substitution path to find itself.
+     */
+    @Test
+    fun `youtube is not prefetched as a substitute for itself`() {
+        assertFalse(SourceKind.YOUTUBE.worthPrefetching)
+    }
+
+    // ---- Racing the sources -------------------------------------------------
+
+    /**
+     * A source that answers after [answerAfterMs] with a stream of [format], or
+     * with nothing at all when [format] is null.
+     *
+     * [asked] records that it was reached, which is how the tests below tell a
+     * source that was beaten from one that was never asked — the distinction
+     * the whole '9:45' investigation turned on.
+     */
+    private class FakeSource(
+        override val displayName: String,
+        private val answerAfterMs: Long,
+        private val format: StreamFormat?,
+        override val kind: SourceKind = SourceKind.JIOSAAVN,
+        private val candidates: List<Song>? = null,
+    ) : MusicSource {
+        override val configId = displayName
+        var asked = false
+            private set
+        var cancelled = false
+            private set
+
+        override suspend fun health() = SourceHealth.Ok()
+
+        override suspend fun search(query: String, limit: Int, waitForAll: Boolean): List<Song> {
+            asked = true
+            try {
+                delay(answerAfterMs)
+            } catch (e: CancellationException) {
+                cancelled = true
+                throw e
+            }
+            if (format == null) return emptyList()
+            return candidates ?: listOf(
+                Song(
+                    videoId = "$displayName-1",
+                    title = RACE_TITLE,
+                    artist = RACE_ARTIST,
+                    thumbnailUrl = null,
+                    durationText = "2:00",
+                ),
+            )
+        }
+
+        override suspend fun stream(trackId: String, request: StreamRequest): SourceStream? =
+            format?.let { SourceStream(url = "https://$displayName/$trackId", format = it) }
+    }
+
+    private fun raceTarget() = TrackMatcher.Target(RACE_TITLE, RACE_ARTIST, durationSec = 120)
+
+    @Test
+    fun `JioSaavn substitution refuses conflicting albums without a target album`() = runBlocking {
+        val source = FakeSource(
+            displayName = "JioSaavn",
+            answerAfterMs = 0,
+            format = StreamFormat("mp4", kbps = 320),
+            candidates = listOf(
+                song("Brown Rang", "Yo Yo Honey Singh", "2:59")
+                    .copy(videoId = "international-villager", albumName = "International Villager"),
+                song("Brown Rang", "Yo Yo Honey Singh", "2:54")
+                    .copy(videoId = "chaar-ikke", albumName = "Chaar Ikke"),
+            ),
+        )
+        val target = TrackMatcher.Target("Brown Rang", "Yo Yo Honey Singh", durationSec = 175)
+
+        assertNull(SourceResolver.bestAcross(listOf(source), target, StreamRequest.Best))
+    }
+
+    /**
+     * The '9:45' case itself, as a race rather than a queue.
+     *
+     * JioSaavn answered in ~0.4s and the module in ~13.5s. Walked in rank order
+     * the module's slowness was JioSaavn's too, so the whole lookup lost the
+     * race against YouTube and the listener got 160kbps Opus. Raced, the quick
+     * answer is the one that starts the track — and the slow source is left to
+     * [SourceResolver.upgradeFor], which judges it against what is playing.
+     */
+    @Test
+    fun `takes the quick answer rather than waiting for a slow better one`() = runBlocking {
+        val slow = FakeSource("Ricky's Addon", answerAfterMs = 2_000, format = StreamFormat("flac"))
+        val quick = FakeSource("JioSaavn", answerAfterMs = 5, format = StreamFormat("mp4", kbps = 320))
+        val elapsed = measureTimeMillis {
+            val (source, stream) = SourceResolver.bestAcross(
+                listOf(slow, quick), raceTarget(), StreamRequest.Lossless,
+            )!!
+            assertEquals("JioSaavn", source.displayName)
+            assertEquals(320, stream.format.kbps)
+        }
+        // Nowhere near the slow source's two seconds.
+        assertTrue("took ${elapsed}ms, so it waited for the slow source", elapsed < 1_000)
+        // Asked, though — being beaten is not the same as being skipped, and
+        // skipping is the bug this replaced.
+        assertTrue(slow.asked)
+    }
+
+    /**
+     * A slow source is cancelled once an answer is in hand rather than left
+     * running: nothing is waiting on it, and the second look re-asks it
+     * properly. Left running it would spend a listener's radio for nothing.
+     */
+    @Test
+    fun `abandons the sources still running once it has an answer`() = runBlocking {
+        val slow = FakeSource("Ricky's Addon", answerAfterMs = 2_000, format = StreamFormat("flac"))
+        val quick = FakeSource("JioSaavn", answerAfterMs = 5, format = StreamFormat("mp4", kbps = 320))
+        SourceResolver.bestAcross(listOf(slow, quick), raceTarget(), StreamRequest.Lossless)
+        assertTrue("the slow source was left running", slow.cancelled)
+    }
+
+    /**
+     * Answers that arrive together are still ranked. Racing gives up ordering
+     * between a fast source and a slow one; it does not give up ordering
+     * between two that answered at the same moment.
+     */
+    @Test
+    fun `prefers the better of two answers that arrive together`() = runBlocking {
+        val worse = FakeSource("Ricky's Addon", answerAfterMs = 5, format = StreamFormat("mp3", kbps = 128))
+        val better = FakeSource("JioSaavn", answerAfterMs = 5, format = StreamFormat("mp4", kbps = 320))
+        val (source, stream) = SourceResolver.bestAcross(
+            listOf(worse, better), raceTarget(), StreamRequest.Lossless,
+        )!!
+        assertEquals("JioSaavn", source.displayName)
+        assertEquals(320, stream.format.kbps)
+    }
+
+    /**
+     * A source that simply doesn't have the track must not end the race. This
+     * is the difference between "nobody has it" and "the first one to answer
+     * didn't have it", and returning null on the latter is how a catalogue that
+     * held the track went unheard.
+     */
+    @Test
+    fun `keeps waiting when the first source to answer has nothing`() = runBlocking {
+        val empty = FakeSource("Ricky's Addon", answerAfterMs = 5, format = null)
+        val holder = FakeSource("JioSaavn", answerAfterMs = 200, format = StreamFormat("mp4", kbps = 320))
+        val (source, _) = SourceResolver.bestAcross(
+            listOf(empty, holder), raceTarget(), StreamRequest.Lossless,
+        )!!
+        assertEquals("JioSaavn", source.displayName)
+    }
+
+    /** Nobody has it: the race ends when the last source has said so. */
+    @Test
+    fun `has nothing when no source holds the track`() = runBlocking {
+        val a = FakeSource("Ricky's Addon", answerAfterMs = 5, format = null)
+        val b = FakeSource("JioSaavn", answerAfterMs = 10, format = null)
+        assertNull(SourceResolver.bestAcross(listOf(a, b), raceTarget(), StreamRequest.Lossless))
+    }
+
+    /**
+     * The background upgrade is deliberately patient. Its source searches have
+     * already been given their full budget, so it must not cancel a slower FLAC
+     * merely because JioSaavn's valid 320kbps answer arrived first.
+     */
+    @Test
+    fun `patient upgrade chooses the better later answer`() = runBlocking {
+        val playing = StreamFormat(codec = "opus", kbps = 141)
+        val slowLossless = FakeSource("Ricky's Addon", answerAfterMs = 200, format = StreamFormat("flac"))
+        val quickLossy = FakeSource("JioSaavn", answerAfterMs = 5, format = StreamFormat("mp4", kbps = 320))
+        val (source, stream) = SourceResolver.bestAcross(
+            listOf(slowLossless, quickLossy),
+            raceTarget(),
+            StreamRequest.Lossless,
+            waitForAll = true,
+            strictLength = true,
+        ) { _, candidate -> SourceResolver.worthSwapping(candidate.format, playing) }!!
+        assertEquals("Ricky's Addon", source.displayName)
+        assertEquals("flac", stream.format.codec)
+        assertFalse("the patient lookup cancelled the later source", slowLossless.cancelled)
+    }
+
+    @Test
+    fun `upgrade refuses same title and runtime from a different artist`() = runBlocking {
+        val wrongMexico = FakeSource(
+            displayName = "Ricky's Addon",
+            answerAfterMs = 0,
+            format = StreamFormat("flac"),
+            candidates = listOf(song("Mexico", "CAKE", "3:26")),
+        )
+        val target = TrackMatcher.Target("Mexico", "Karan Aujla", durationSec = 207)
+
+        assertNull(
+            SourceResolver.bestAcross(
+                listOf(wrongMexico),
+                target,
+                StreamRequest.Lossless,
+                waitForAll = true,
+                strictLength = true,
+                requireSharedArtist = true,
+            ),
+        )
+    }
+
+    /**
+     * A refused answer is not an answer. When the only quick source is one whose
+     * stream fails the predicate, the race has to keep running rather than
+     * report that nothing was found.
+     */
+    @Test
+    fun `keeps waiting when the quick answer is refused`() = runBlocking {
+        val playing = StreamFormat(codec = "opus", kbps = 141)
+        val quickRefused = FakeSource("Ricky's Addon", answerAfterMs = 5, format = StreamFormat("mp3", kbps = 128))
+        val slowTaken = FakeSource("JioSaavn", answerAfterMs = 200, format = StreamFormat("mp4", kbps = 320))
+        val (source, _) = SourceResolver.bestAcross(
+            listOf(quickRefused, slowTaken),
+            raceTarget(),
+            StreamRequest.Lossless,
+        ) { _, candidate -> SourceResolver.worthSwapping(candidate.format, playing) }!!
+        assertEquals("JioSaavn", source.displayName)
     }
 
     // ---- Asking ------------------------------------------------------------

@@ -29,15 +29,22 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.res.pluralStringResource
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import coil3.compose.AsyncImage
+import com.music.bitchord.R
 import com.music.bitchord.data.model.BrowseType
 import com.music.bitchord.data.model.ROW_ART_PX
 import com.music.bitchord.data.model.Song
 import com.music.bitchord.data.model.UserPlaylist
 import com.music.bitchord.data.model.artworkAt
+import com.music.bitchord.download.DownloadState
+import com.music.bitchord.download.Downloads
 import com.music.bitchord.ui.icons.BitChordIcons
+import java.util.Locale
 
 /**
  * The album or playlist a long-press is acting on.
@@ -96,14 +103,6 @@ data class BrowseTarget(
      * questions about the download record, not about what this sheet is.
      */
     val downloadId: String? = null,
-    /**
-     * Set when the sheet is being opened from the release page's own download
-     * circle after every track is already on disk — that tap means "I know
-     * it's downloaded, let me remove it", not "show me the menu", so the
-     * delete-download row opens already armed instead of making the tap land
-     * twice.
-     */
-    val highlightDeleteDownload: Boolean = false,
 )
 
 /**
@@ -114,7 +113,7 @@ data class BrowseTarget(
  * sheet serves a card on the home feed and the page that card opens. A card
  * has no other way to play its album without navigating to it, so it gets Play
  * and Shuffle; the page's own header already carries both, so there they are
- * null and the sheet is the two queue rows and nothing else.
+ * null and the sheet is the queue rows and the download.
  *
  * The queue rows are always offered. They are the reason this menu exists: a
  * release is exactly the kind of thing someone wants *after* what is playing
@@ -136,6 +135,14 @@ fun BrowseActionsSheet(
     /** Null where the sheet was opened from the page it would navigate to. */
     onOpen: (() -> Unit)? = null,
     onDownloadAll: (() -> Unit)? = null,
+    /**
+     * Set whenever [target] is a playlist, regardless of who owns it — pinning
+     * doesn't touch the account, only what sits at the top of this device's
+     * Library tab. Null everywhere else (albums, artists), where "pin" has
+     * nothing to mean.
+     */
+    isPinned: Boolean = false,
+    onTogglePin: (() -> Unit)? = null,
     onRename: ((String) -> Unit)? = null,
     onDelete: (() -> Unit)? = null,
     /**
@@ -149,7 +156,7 @@ fun BrowseActionsSheet(
 ) {
     var renaming by remember { mutableStateOf(false) }
     var confirmingDelete by remember { mutableStateOf(false) }
-    var confirmingDeleteDownload by remember { mutableStateOf(target.highlightDeleteDownload) }
+    var confirmingDeleteDownload by remember { mutableStateOf(false) }
 
     val playlist = target.playlist
     if (renaming && playlist != null && onRename != null) {
@@ -166,39 +173,100 @@ fun BrowseActionsSheet(
         BrowseSheetHeader(target)
         HorizontalDivider(thickness = 0.5.dp, color = MaterialTheme.colorScheme.outline)
 
-        onPlay?.let { ActionRow(Icons.Rounded.PlayArrow, "Play", onClick = it) }
-        onShuffle?.let { ActionRow(BitChordIcons.Shuffle, "Shuffle", onClick = it) }
-        ActionRow(Icons.AutoMirrored.Rounded.PlaylistPlay, "Play next", onClick = onPlayNext)
-        ActionRow(Icons.AutoMirrored.Rounded.QueueMusic, "Add to queue", onClick = onAddToQueue)
-        onDownloadAll?.let { ActionRow(BitChordIcons.Download, "Download all", onClick = it) }
+        onPlay?.let { ActionRow(Icons.Rounded.PlayArrow, stringResource(R.string.play), onClick = it) }
+        onShuffle?.let { ActionRow(BitChordIcons.Shuffle, stringResource(R.string.shuffle), onClick = it) }
+        ActionRow(
+            Icons.AutoMirrored.Rounded.PlaylistPlay,
+            stringResource(R.string.play_next),
+            onClick = onPlayNext,
+        )
+        ActionRow(
+            Icons.AutoMirrored.Rounded.QueueMusic,
+            stringResource(R.string.add_to_queue),
+            onClick = onAddToQueue,
+        )
+        onDownloadAll?.let { download ->
+            // Saying which of the three it is, rather than offering the same row
+            // whatever the state — this is where a release is asked for now that
+            // its page's header spends that spot on the search, and a menu that
+            // can't say "already on the device" leaves the question open. The
+            // tap is left live in every state: [Downloads.enqueue] leaves a
+            // track that is saved, queued or running alone.
+            val active by Downloads.active.collectAsStateWithLifecycle()
+            val requested by Downloads.requested.collectAsStateWithLifecycle()
+            val saved by Downloads.saved.collectAsStateWithLifecycle()
+            // Only the tracks *this release* asked for — two releases can share
+            // a track, and reading the whole queue would show this release
+            // waiting on a download some other one started. Failed entries stay
+            // in [Downloads.active] until dismissed, and a failure is not a wait.
+            val waiting = target.browseId?.let { requested[it] }.orEmpty().any { id ->
+                when (active[id]) {
+                    is DownloadState.Queued, is DownloadState.Running -> true
+                    else -> false
+                }
+            }
+            // The same reading [DownloadedBadge] does per row: a release counts
+            // as downloaded once every one of its tracks is in the saved set,
+            // not from any record of the release itself. Empty for a card whose
+            // page was never opened, which is not an answer either way.
+            val ids = remember(target.songs) { target.songs.mapTo(HashSet()) { it.videoId } }
+            val downloaded = !waiting && ids.isNotEmpty() && ids.all { it in saved }
+            ActionRow(
+                icon = when {
+                    waiting -> BitChordIcons.Clock
+                    downloaded -> BitChordIcons.Check
+                    else -> BitChordIcons.Download
+                },
+                label = stringResource(R.string.download_all),
+                value = when {
+                    waiting -> stringResource(R.string.downloading)
+                    downloaded -> stringResource(R.string.downloaded)
+                    else -> null
+                },
+                onClick = download,
+            )
+        }
         onOpen?.let {
-            ActionRow(BitChordIcons.ChevronRight, "Open ${target.type.noun}".trim(), onClick = it)
+            ActionRow(
+                BitChordIcons.ChevronRight,
+                target.type.localizedOpenLabel(),
+                onClick = it,
+            )
+        }
+        onTogglePin?.let {
+            ActionRow(
+                BitChordIcons.Pin,
+                stringResource(if (isPinned) R.string.unpin else R.string.pin),
+                onClick = it,
+            )
         }
         if (onRename != null) {
-            ActionRow(Icons.Rounded.Edit, "Rename") { renaming = true }
+            ActionRow(Icons.Rounded.Edit, stringResource(R.string.rename)) { renaming = true }
         }
         if (onDelete != null) {
             if (confirmingDelete) {
                 ActionRow(
                     icon = Icons.Rounded.DeleteForever,
-                    label = "Delete \"${target.title}\" — tap to confirm",
+                    label = stringResource(R.string.delete_playlist_confirmation, target.title),
                     tint = MaterialTheme.colorScheme.error,
                     onClick = onDelete,
                 )
             } else {
-                ActionRow(Icons.Rounded.Delete, "Delete playlist") { confirmingDelete = true }
+                ActionRow(Icons.Rounded.Delete, stringResource(R.string.delete_playlist)) { confirmingDelete = true }
             }
         }
         if (onDeleteDownload != null) {
             if (confirmingDeleteDownload) {
                 ActionRow(
                     icon = Icons.Rounded.DeleteForever,
-                    label = "Remove \"${target.title}\" from this device — tap to confirm",
+                    label = stringResource(R.string.delete_download_confirmation, target.title),
                     tint = MaterialTheme.colorScheme.error,
                     onClick = onDeleteDownload,
                 )
             } else {
-                ActionRow(Icons.Rounded.Delete, "Delete download") { confirmingDeleteDownload = true }
+                ActionRow(Icons.Rounded.Delete, stringResource(R.string.delete_download)) {
+                    confirmingDeleteDownload = true
+                }
             }
         }
         Spacer(Modifier.height(24.dp))
@@ -239,9 +307,9 @@ private fun BrowseSheetHeader(target: BrowseTarget) {
                 // unknown kind has neither, and gets the track count instead —
                 // which by then is the one thing actually known about it.
                 text = target.subtitle.ifBlank {
-                    target.type.noun.replaceFirstChar { it.uppercase() }.ifBlank {
+                    target.type.localizedNoun().replaceFirstChar { it.uppercase(Locale.getDefault()) }.ifBlank {
                         target.songs.size.takeIf { it > 0 }
-                            ?.let { "$it ${if (it == 1) "song" else "songs"}" }
+                            ?.let { pluralStringResource(R.plurals.song_count_plural, it, it) }
                             .orEmpty()
                     }
                 },
@@ -259,10 +327,18 @@ private fun BrowseSheetHeader(target: BrowseTarget) {
  * is a home card nobody has identified yet — "Open" without a noun is still a
  * true label for it, and guessing "album" would not be.
  */
-private val BrowseType.noun: String
-    get() = when (this) {
-        BrowseType.ALBUM -> "album"
-        BrowseType.PLAYLIST -> "playlist"
-        BrowseType.ARTIST -> "artist"
-        BrowseType.OTHER -> ""
-    }
+@Composable
+private fun BrowseType.localizedNoun(): String = when (this) {
+    BrowseType.ALBUM -> stringResource(R.string.album)
+    BrowseType.PLAYLIST -> stringResource(R.string.playlist)
+    BrowseType.ARTIST -> stringResource(R.string.artist)
+    BrowseType.OTHER -> ""
+}
+
+@Composable
+private fun BrowseType.localizedOpenLabel(): String = when (this) {
+    BrowseType.ALBUM -> stringResource(R.string.open_album)
+    BrowseType.ARTIST -> stringResource(R.string.open_artist)
+    BrowseType.PLAYLIST -> stringResource(R.string.open_playlist)
+    BrowseType.OTHER -> stringResource(R.string.open)
+}

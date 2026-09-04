@@ -15,6 +15,12 @@ data class Song(
     /** A music-video upload rather than the catalogue track. */
     val isVideo: Boolean = false,
     /**
+     * True for a video upload and for its manually selected catalogue match.
+     * The latter remains video-origin so playback policies such as AutoMix do
+     * not mistake a converted video for a normal music track.
+     */
+    val isVideoOrigin: Boolean = isVideo,
+    /**
      * This track's identity *within one playlist*, which is not its [videoId]:
      * the same song added twice is two entries with two set-video-ids, and
      * removing one of them is only expressible in those terms. Present only on
@@ -29,9 +35,17 @@ data class Song(
      */
     val fromAutoplay: Boolean = false,
     /**
+     * The seed title of an explicitly started radio queue. Every item in that
+     * queue carries the same value, so the player can keep naming the station
+     * across skips and queue edits without holding UI-only session state.
+     */
+    val radioName: String? = null,
+    /**
      * Explicit content or file URI for local device tracks or downloaded audio.
      */
     val localUri: String? = null,
+    /** A premium rendition marker recorded by BitChord for its Downloads list. */
+    val downloadFormat: String? = null,
     /**
      * Real filesystem path backing [localUri], when MediaStore exposes one.
      * Lets playback swap a content:// row for a raw file:// path on formats
@@ -42,6 +56,9 @@ data class Song(
     val localLyricsUri: String? = null,
     val localLyricsSource: String? = null,
     val localLyricsFormat: String? = null,
+    /** MediaStore timestamps used only to sort device and downloaded libraries. */
+    val localDateAddedSeconds: Long? = null,
+    val localDateModifiedSeconds: Long? = null,
     /**
      * What a non-YouTube source says it can serve this recording at, as one of
      * `LOSSLESS`, `HIGH` or `LOW` — null for every row that didn't come from
@@ -55,6 +72,8 @@ data class Song(
      * the track played as a 128kbps MP3.
      */
     val sourceQuality: String? = null,
+    /** Explicit-content state from the catalogue; null when that source does not say. */
+    val isExplicit: Boolean? = null,
 )
 
 /**
@@ -138,12 +157,17 @@ data class BrowseItem(
 
 /** Search rows are heterogeneous once filters other than "Songs" are used. */
 sealed interface SearchResult {
+    /** The promoted card returned only at the head of an unfiltered search. */
+    data class TopTrack(val song: Song) : SearchResult
     data class Track(val song: Song) : SearchResult
     data class Browse(val item: BrowseItem) : SearchResult
 }
 
 enum class SearchFilter(val label: String, val params: String?) {
+    /** YouTube Music's mixed search page: songs, artists, albums and playlists. */
+    ALL("All", null),
     SONGS("Songs", "EgWKAQIIAWoKEAkQChAFEAMQBA=="),
+    VIDEOS("Videos", "EgWKAQIQAWoKEAkQChAFEAMQBA=="),
     ALBUMS("Albums", "EgWKAQIYAWoKEAkQChAFEAMQBA=="),
     ARTISTS("Artists", "EgWKAQIgAWoKEAkQChAFEAMQBA=="),
     PLAYLISTS("Playlists", "EgWKAQIoAWoKEAkQChAFEAMQBA=="),
@@ -165,6 +189,36 @@ data class Account(
     val thumbnailUrl: String?,
 )
 
+/**
+ * One identity the signed-in session can act as: the Google account's own
+ * channel, plus any brand channel it owns.
+ *
+ * A brand channel is a separate YouTube identity attached to the same login,
+ * and YouTube Music treats it as a separate listener — its own library, likes,
+ * history and recommendations. Nothing in the cookie says which one is meant,
+ * so a client that never asks gets whichever one the web player happens to
+ * default to, which is why a listener whose music lives on a brand channel
+ * signs in and is shown a stranger's account.
+ *
+ * @param pageId `X-Goog-PageId`. Null for the account's own channel, which is
+ *   not a delegated page and must not be given one.
+ * @param dataSyncId `context.user.onBehalfOfUser`, taken from the switcher's
+ *   `datasyncIdToken` — never guessed, since Google answers one it cannot tie
+ *   to the session with 401.
+ */
+data class AccountChannel(
+    val name: String,
+    val subtitle: String,
+    val thumbnailUrl: String?,
+    val pageId: String?,
+    val dataSyncId: String?,
+    /** Whether YouTube's own switcher marks this as the session's active one. */
+    val activeOnWeb: Boolean,
+) {
+    /** Identity of the selection, stable across refetches of the list. */
+    val key: String get() = pageId ?: dataSyncId ?: name
+}
+
 data class HomeShelf(
     val title: String,
     val items: List<ShelfItem>,
@@ -176,6 +230,21 @@ data class HomeShelf(
 data class HomeFeed(
     val shelves: List<HomeShelf>,
     val continuation: String?,
+)
+
+/** One server-defined group of the buttons shown on Explore. */
+data class MoodGenreSection(
+    val title: String,
+    val items: List<MoodGenre>,
+)
+
+/** A mood or genre button and the exact browse request that it represents. */
+data class MoodGenre(
+    val title: String,
+    val browseId: String,
+    val params: String?,
+    /** First real cover from the category's playlist shelves, loaded in the background. */
+    val thumbnailUrl: String? = null,
 )
 
 /**
@@ -215,6 +284,16 @@ data class DetailPage(
      * album or playlist fetched with a session; see [LibraryState].
      */
     val library: LibraryState? = null,
+    /**
+     * The editorial blurb YouTube Music writes for a release or an artist —
+     * absent for most playlists, which is also why the "About" section only
+     * ever shows for an album or an artist page.
+     */
+    val description: String? = null,
+    /** "1.2M subscribers" off an artist page's header — see [ArtistPage.subscriberCountText]. */
+    val subscriberCountText: String? = null,
+    /** "3.4M monthly listeners" off an artist page's header. */
+    val monthlyListenerCount: String? = null,
 )
 
 /**
@@ -241,6 +320,12 @@ data class ArtistPage(
     val thumbnailUrl: String? = null,
     /** The single artist this page is for, as the header bills them. */
     val name: String? = null,
+    /** The artist bio YouTube Music writes for the page, when it has one. */
+    val description: String? = null,
+    /** "1.2M subscribers" — the artist's YouTube channel, when subscribed counts are shown. */
+    val subscriberCountText: String? = null,
+    /** "3.4M monthly listeners", off the same header. */
+    val monthlyListenerCount: String? = null,
 )
 
 /**

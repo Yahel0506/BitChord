@@ -8,18 +8,24 @@ import kotlinx.coroutines.coroutineScope
 /**
  * Where the player gets its lyrics.
  *
- * Four sources, in this order:
+ * Eight sources, tried in [order] — the user's own priority list in Settings,
+ * defaulting to [LyricsSource.entries]:
  *
- *  1. [BetterLyrics] — Apple Music TTML, per-syllable, keyed on title/artist.
- *  2. [LyricsPlus] — the YouLy+ backend; finest timing of the lot, flakiest hosting.
- *  3. [SimpMusicLyrics] — keyed on the video id, so it can't fetch the wrong edit.
- *  4. [LrcLib] — line-synced only, but it is the one that is always up.
+ *  - [BetterLyrics] and [PaxSenix] — Apple Music TTML, per-syllable, from two
+ *    independent hosts so one having a bad day doesn't cost the timing.
+ *  - [LyricsPlus] — the YouLy+ backend; finest timing of the lot, flakiest hosting.
+ *  - [SimpMusicLyrics] — keyed on the video id, so it can't fetch the wrong edit.
+ *  - [LrcLib], [Musixmatch], [KuGou] — line-synced only, but between them
+ *    almost always up, and [KuGou] carries a lot that the others don't.
  *
- * The first three are asked *at the same time* and their answers taken in that
- * order. Asked one after another, a miss on each of the first two would cost
- * its own round trip before the third was even tried, and a track with no
- * lyrics anywhere would spend the best part of twenty seconds finding that
- * out. Run together, a miss costs whatever the slowest one took.
+ * Every enabled source is asked *at the same time*, but their answers are
+ * taken in [order]: the loop awaits them one at a time in that sequence, so a
+ * lower-priority source finishing first never preempts one still pending
+ * ahead of it. Asked one after another instead, a miss on each source would
+ * cost its own round trip before the next was even tried, and a track with no
+ * lyrics anywhere would spend the best part of a minute finding that out with
+ * eight of them. Run together, a miss costs whatever the slowest one needed
+ * to still be waited on took.
  *
  * A word-timed answer wins outright. Failing that, a line-timed one is taken
  * from the highest-priority source that had it — better a whole line lighting
@@ -38,7 +44,7 @@ object LyricsRepository {
             LyricsArtifactFormat.ENHANCED_LRC -> EnhancedLrc.parse(content)
             LyricsArtifactFormat.LRC -> LrcLib.parseLrc(content)
         }.takeIf { it.isNotEmpty() } ?: return null
-        return Result(
+        return result(
             source = source,
             lines = lines,
             artifact = LyricsArtifact(source, format, content, lines),
@@ -52,10 +58,41 @@ object LyricsRepository {
         val artifact: LyricsArtifact? = null,
     )
 
+    /** Direct artifact lookup for download and caching flows. */
+    suspend fun artifact(
+        videoId: String,
+        title: String,
+        artist: String,
+        durationMs: Long,
+        album: String? = null,
+        sources: Set<LyricsSource> = LyricsSource.entries.toSet(),
+        order: List<LyricsSource> = LyricsSource.entries,
+        prioritizeSyllableSync: Boolean = false,
+    ): LyricsArtifact? = lyrics(
+        videoId = videoId,
+        title = title,
+        artist = artist,
+        durationMs = durationMs,
+        album = album,
+        sources = sources,
+        order = order,
+        prioritizeSyllableSync = prioritizeSyllableSync,
+    )?.artifact
+
     /**
      * [sources] is the user's pick from Settings; anything not in it is not
      * contacted at all. An empty set means no lyrics, which is the same answer
-     * as switching the feature off.
+     * as switching the feature off. [order] is tried first-to-last; a source
+     * missing from it (an upgrade that added one after the order was last
+     * saved) falls in after everything named, in [LyricsSource]'s own order.
+     *
+     * [prioritizeSyllableSync] decides what happens once *something* has come
+     * back: off, the highest-priority source's own answer is taken as-is,
+     * word-synced or not — priority is priority, and second-guessing it with
+     * more network calls after it has already answered is not what "first"
+     * was supposed to mean. On, a merely line-synced answer is kept only as a
+     * fallback, and the search keeps going through the rest of [order] for a
+     * word-synced one, taking the top-priority source that has one.
      */
     suspend fun lyrics(
         videoId: String,
@@ -64,56 +101,113 @@ object LyricsRepository {
         durationMs: Long,
         album: String? = null,
         sources: Set<LyricsSource> = LyricsSource.entries.toSet(),
+        order: List<LyricsSource> = LyricsSource.entries,
+        prioritizeSyllableSync: Boolean = false,
     ): Result? = coroutineScope {
-        val racing: List<Pair<LyricsSource, Deferred<LyricsArtifact?>>> = buildList {
-            if (LyricsSource.BETTER_LYRICS in sources) {
-                add(
-                    LyricsSource.BETTER_LYRICS to
-                        async(Dispatchers.IO) { BetterLyrics.artifact(title, artist, durationMs, album) },
-                )
-            }
-            if (LyricsSource.LYRICS_PLUS in sources) {
-                add(
-                    LyricsSource.LYRICS_PLUS to
-                        async(Dispatchers.IO) { LyricsPlus.artifact(title, artist, durationMs, album) },
-                )
-            }
-            if (LyricsSource.SIMP_MUSIC in sources) {
-                add(
-                    LyricsSource.SIMP_MUSIC to
-                        async(Dispatchers.IO) { SimpMusicLyrics.artifact(videoId, durationMs) },
-                )
+        LyricsLog.clear()
+        LyricsLog.i("Repository", "Looking up lyrics for \"$title\" by \"$artist\" (${durationMs / 1000}s)")
+
+        val sequence = order.filter { it in sources } +
+            LyricsSource.entries.filter { it in sources && it !in order }
+
+        LyricsLog.i("Repository", "Active sources order: ${sequence.joinToString { it.label }}")
+
+        // Genius is a plain text web scraper. To preserve bandwidth and avoid rate-limiting,
+        // it starts lazily and is only contacted if all higher-priority synced sources miss.
+        val racing: List<Pair<LyricsSource, Deferred<LyricsArtifact?>>> = sequence.map { source ->
+            val startMode = if (source == LyricsSource.GENIUS) kotlinx.coroutines.CoroutineStart.LAZY else kotlinx.coroutines.CoroutineStart.DEFAULT
+            source to async(Dispatchers.IO, start = startMode) {
+                fetchArtifact(source, videoId, title, artist, durationMs, album)
             }
         }
 
         try {
             var lineSynced: Result? = null
             for ((source, job) in racing) {
-                val artifact = try {
-                    job.await()
-                } catch (cancelled: kotlinx.coroutines.CancellationException) {
-                    throw cancelled
-                } catch (_: Exception) {
-                    null
-                } ?: continue
-                if (artifact.lines.any { it.isWordSynced }) {
-                    return@coroutineScope Result(source, artifact.lines, artifact)
+                // If we already found a line-synced or better result, skip Genius completely
+                if (lineSynced != null && source == LyricsSource.GENIUS) {
+                    LyricsLog.i("Repository", "Skipping Genius fallback because higher-priority source answered")
+                    continue
                 }
-                if (lineSynced == null) {
-                    lineSynced = Result(source, artifact.lines, artifact)
+
+                if (source == LyricsSource.GENIUS && lineSynced == null) {
+                    LyricsLog.w("Repository", "All synced providers missed. Running Genius fallback...")
                 }
+
+                val artifact = runCatching { job.await() }.getOrNull() ?: continue
+                val lines = artifact.lines
+                if (lines.any { it.isWordSynced }) {
+                    LyricsLog.s("Repository", "Word-synced match from ${source.label}")
+                    return@coroutineScope result(source, lines, artifact)
+                }
+                if (!prioritizeSyllableSync && lines.any { it.timeMs > 0 }) {
+                    LyricsLog.s("Repository", "Line-synced match from ${source.label}")
+                    return@coroutineScope result(source, lines, artifact)
+                }
+                if (lineSynced == null) lineSynced = result(source, lines, artifact)
             }
-            lineSynced ?: if (LyricsSource.LRCLIB in sources) {
-                LrcLib.artifact(title, artist, durationMs)?.let {
-                    Result(LyricsSource.LRCLIB, it.lines, it)
-                }
-            } else {
-                null
-            }
+            lineSynced
         } finally {
             // Whoever lost the race is no longer worth waiting on, and
             // coroutineScope will not return while they are still running.
             racing.forEach { it.second.cancel() }
         }
+    }
+
+    private suspend fun fetchArtifact(
+        source: LyricsSource,
+        videoId: String,
+        title: String,
+        artist: String,
+        durationMs: Long,
+        album: String?,
+    ): LyricsArtifact? {
+        LyricsLog.i(source.label, "Querying $source...")
+        val artifact = when (source) {
+            LyricsSource.BETTER_LYRICS -> BetterLyrics.artifact(title, artist, durationMs, album)
+            LyricsSource.LYRICS_PLUS -> LyricsPlus.artifact(title, artist, durationMs, album)
+            LyricsSource.SIMP_MUSIC -> SimpMusicLyrics.artifact(videoId, durationMs)
+            LyricsSource.LRCLIB -> LrcLib.artifact(title, artist, durationMs)
+            LyricsSource.MUSIXMATCH -> Musixmatch.lyrics(title, artist, durationMs)?.let {
+                LyricsSerializer.fromLines(LyricsSource.MUSIXMATCH, it)
+            }
+            LyricsSource.PAXSENIX -> PaxSenix.lyrics(title, artist, durationMs, album)?.let {
+                LyricsSerializer.fromLines(LyricsSource.PAXSENIX, it)
+            }
+            LyricsSource.KUGOU -> KuGou.lyrics(title, artist, durationMs, album)?.let {
+                LyricsSerializer.fromLines(LyricsSource.KUGOU, it)
+            }
+            LyricsSource.GENIUS -> Genius.lyrics(title, artist)?.let {
+                LyricsSerializer.fromLines(LyricsSource.GENIUS, it)
+            }
+        }
+        if (artifact == null || artifact.lines.isEmpty()) {
+            LyricsLog.w(source.label, "No lyrics returned")
+        } else {
+            val syncType = when {
+                artifact.isWordSynced -> "word-synced"
+                artifact.lines.any { it.timeMs > 0 } -> "line-synced"
+                else -> "plain text"
+            }
+            LyricsLog.s(source.label, "Returned ${artifact.lines.size} lines ($syncType)")
+        }
+        return artifact
+    }
+
+    /**
+     * Whichever source won, its lines get the same last pass: the answering
+     * vocal split off the lead so it can be drawn under it. Done here rather
+     * than in each parser because most of them write it as a bracket and only
+     * [TtmlLyrics] knows it structurally — [withBackgroundVocals] leaves that
+     * one's own split alone.
+     */
+    private fun result(
+        source: LyricsSource,
+        lines: List<LyricLine>,
+        artifact: LyricsArtifact? = null,
+    ): Result {
+        val processed = lines.withBackgroundVocals()
+        val finalArtifact = artifact ?: LyricsSerializer.fromLines(source, processed)
+        return Result(source, processed, finalArtifact)
     }
 }

@@ -1,5 +1,8 @@
 package com.music.bitchord.ui.player
 
+import com.music.bitchord.R
+import com.music.bitchord.ui.components.ExplicitSongTitle
+
 import android.database.ContentObserver
 import android.graphics.Bitmap
 import android.media.AudioManager
@@ -13,6 +16,7 @@ import android.window.OnBackInvokedDispatcher
 import androidx.activity.compose.BackHandler
 import androidx.annotation.RequiresApi
 import androidx.compose.animation.animateColorAsState
+import androidx.compose.animation.Crossfade
 import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.LinearEasing
@@ -72,6 +76,7 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.QueueMusic
+import androidx.compose.material.icons.automirrored.rounded.Undo
 import androidx.compose.material.icons.automirrored.rounded.VolumeDown
 import androidx.compose.material.icons.automirrored.rounded.VolumeUp
 import androidx.compose.material.icons.rounded.Cast
@@ -81,9 +86,11 @@ import androidx.compose.material.icons.rounded.FastForward
 import androidx.compose.material.icons.rounded.FastRewind
 import androidx.compose.material.icons.rounded.GraphicEq
 import androidx.compose.material.icons.rounded.Headphones
+import androidx.compose.material.icons.rounded.History
 import androidx.compose.material.icons.rounded.MoreHoriz
 import androidx.compose.material.icons.rounded.Pause
 import androidx.compose.material.icons.rounded.PlayArrow
+import androidx.compose.material.icons.rounded.Videocam
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
@@ -110,6 +117,8 @@ import androidx.compose.runtime.snapshotFlow
 import kotlinx.coroutines.flow.first
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.res.stringArrayResource
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.draw.drawWithContent
@@ -120,10 +129,12 @@ import androidx.compose.ui.graphics.CompositingStrategy
 import androidx.compose.ui.graphics.Shadow
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.TransformOrigin
+import androidx.compose.ui.graphics.painter.Painter
 import androidx.compose.ui.graphics.drawscope.ContentDrawScope
 import androidx.compose.ui.graphics.drawscope.clipRect
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.input.nestedscroll.NestedScrollConnection
 import androidx.compose.ui.input.nestedscroll.NestedScrollSource
 import androidx.compose.ui.input.nestedscroll.nestedScroll
@@ -147,10 +158,14 @@ import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.TextLayoutResult
 import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.Dp
+import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.lerp
 import androidx.compose.ui.unit.Velocity
@@ -160,7 +175,9 @@ import androidx.media3.common.Player
 import coil3.compose.AsyncImage
 import coil3.compose.AsyncImagePainter
 import coil3.request.ImageRequest
+import com.music.bitchord.ui.rememberIsForeground
 import com.music.bitchord.ui.components.thumbnailBorder
+import com.music.bitchord.ui.components.optimizedHazeEffect
 import com.music.bitchord.ui.haptics.Haptic
 import com.music.bitchord.ui.haptics.rememberHaptics
 import com.music.bitchord.ui.icons.BitChordIcons
@@ -169,8 +186,11 @@ import com.music.bitchord.data.NerdStats
 import com.music.bitchord.data.settings.TrackAnalysisState
 import com.music.bitchord.data.canvas.CanvasArtwork
 import com.music.bitchord.data.canvas.CanvasRepository
+import com.music.bitchord.data.canvas.CanvasSource
+import com.music.bitchord.data.lyrics.Genius
 import com.music.bitchord.data.lyrics.LyricLine
 import com.music.bitchord.data.lyrics.LyricsSource
+import com.music.bitchord.ui.components.LyricsLogConsole
 import com.music.bitchord.data.settings.AppSettings
 import com.music.bitchord.data.settings.AudioQuality
 import com.music.bitchord.data.model.LikeStatus
@@ -179,6 +199,11 @@ import com.music.bitchord.data.model.artworkAt
 import com.music.bitchord.playback.BACK_RESTARTS_AFTER_MS
 import com.music.bitchord.playback.autoplaySectionStart
 import kotlinx.coroutines.launch
+import dev.chrisbanes.haze.HazeState
+import dev.chrisbanes.haze.hazeSource
+import dev.chrisbanes.haze.materials.ExperimentalHazeMaterialsApi
+import dev.chrisbanes.haze.materials.HazeMaterials
+import java.util.Locale
 import java.util.concurrent.TimeUnit
 import kotlin.math.abs
 import kotlin.math.roundToInt
@@ -193,6 +218,9 @@ private const val ART_PX = 1200
  * enough not to be noticed on a track that has no album to find.
  */
 private const val ALBUM_SETTLE_MS = 700L
+
+/** Long enough for the post-upgrade rollback cue to be noticed without lingering. */
+private const val REVERT_CUE_MS = 2_600L
 
 /**
  * How close the player's reported position has to get to a released scrub
@@ -257,6 +285,7 @@ private val ART_BOX_TOP_PAD = 14.dp
  * that was cut off rather than one that ran out.
  */
 private const val HERO_FADE_FRACTION = 0.42f
+
 /** The player's side margin. Scrollable panels reach back across it. */
 private val PLAYER_GUTTER = 30.dp
 /**
@@ -429,122 +458,16 @@ private const val GLOW_TRAIL_FLOOR = 0.55f
  */
 private val GLOW_ROOM = 10.dp
 
-/** Stands in for an instrumental stretch on the single-line strip. */
-private const val INSTRUMENTAL_MARK = "Instrumental"
-
 /**
- * Shown on the strip during the intro, before the first sung line — one picked
- * at random per track, so the wait for the vocals has some character to it.
+ * How the answering vocal is drawn: smaller than the lead and a shade behind
+ * it, the way Apple Music hangs a backing line under the one it answers.
+ *
+ * Small enough to be read as a second voice at a glance and no smaller —
+ * these are the words of the song, not a caption.
  */
-private val INTRO_LINES = listOf(
-    "Beat's landing",
-    "Song's starting",
-    "Intro's cooking",
-    "Warming up",
-    "Here we go",
-    "Setting the mood",
-    "Drums are in",
-    "Bass first, words later",
-    "Turn it up",
-    "Vibe check",
-    "Wait for it",
-    "Feel that build",
-    "Let it ride",
-    "Just the groove for now",
-    "Speakers breathing",
-    "Rolling in",
-    "Hold tight",
-    "Riff o'clock",
-    "Strings first",
-    "Hook's on the way",
-    "Eyes closed",
-    "Loading the vibe",
-    "Almost words",
-    "Pure heat, no words",
-    "Tuning in",
-    "Buckle up",
-    "Let it breathe",
-    "That opening though",
-    "Bass is talking",
-    "Lyrics loading",
-    "Give it a sec",
-    "Building something",
-    "Cue the vocals",
-    "Slow burn",
-    "First notes in",
-    "Nod along",
-    "Groove's on deck",
-    "Melody first",
-    "Ease into it",
-    "Big things coming",
-    "Stage is set",
-    "The calm before",
-    "Sit with it",
-    "Any second now",
-    "Volume up, phone down",
-    "Drums doing the talking",
-    "Locked in",
-    "Something's brewing",
-    "Finding its feet",
-    "Deep breath",
-)
-
-/**
- * Shown on the strip while a lyrics lookup is still in flight — one picked
- * at random per track, in the same spirit as [INTRO_LINES].
- */
-private val LYRICS_LOADING_LINES = listOf(
-    "Getting lyrics",
-    "Chasing the words",
-    "Digging up the lyrics",
-    "Words incoming",
-    "On the hunt for lyrics",
-    "Fetching the verses",
-    "Tracking down the words",
-    "Lyrics loading",
-    "Reading between the lines",
-    "Scanning for lyrics",
-    "Words on the way",
-    "Looking this one up",
-    "Checking the lyric sheet",
-    "Pulling up the words",
-    "Searching the songbook",
-    "Lining up the lyrics",
-    "One sec, finding the words",
-    "Combing through for lyrics",
-    "Lyrics inbound",
-    "Sourcing the verses",
-    "Cross-checking the words",
-    "Rounding up the lyrics",
-    "Text hunt in progress",
-    "Syncing up the words",
-    "Peeking at the lyric sheet",
-    "Almost got the words",
-    "Fishing for lyrics",
-    "Grabbing the transcript",
-    "Lyrics, one moment",
-    "Tuning in the words",
-    "Locating the verses",
-    "Words are en route",
-    "Checking the archives",
-    "Piecing the lyrics together",
-    "Loading up the words",
-    "Lyric search underway",
-    "Finding the right words",
-    "Tracking the lyric sheet",
-    "Verses incoming",
-    "Getting the words lined up",
-    "Hang tight, fetching lyrics",
-    "Looking for the hook",
-    "Words are loading",
-    "Lyrics on their way",
-    "Checking what's sung here",
-    "Reading the room for lyrics",
-    "Lyric lookup in progress",
-    "Bringing up the words",
-    "Just a sec, finding words",
-    "Lyrics coming together",
-)
+private val BACKING_FONT_SIZE = 19.sp
+private val BACKING_LINE_HEIGHT = 24.sp
+private const val BACKING_ALPHA = 0.72f
 
 private const val LYRICS_UNAVAILABLE_HOLD_MS = 5_000L
 private const val LYRICS_UNAVAILABLE_FADE_MS = 900
@@ -562,6 +485,12 @@ fun NowPlayingScreen(
     isLoading: Boolean,
     positionMs: Long,
     durationMs: Long,
+    /** True only while this current item is the manual catalogue-audio match. */
+    isAudioVersion: Boolean,
+    /** A catalogue lookup is in progress for this video's manual conversion. */
+    audioVersionSwitching: Boolean,
+    /** The player has just swapped this item to a higher-quality source. */
+    qualityUpgraded: Boolean,
     queue: List<Song>,
     queueIndex: Int,
     hasPrevious: Boolean,
@@ -588,6 +517,7 @@ fun NowPlayingScreen(
      * freshest duration is.
      */
     onSeekFraction: (Float) -> Unit,
+    onToggleAudioVersion: () -> Unit,
     onToggleShuffle: () -> Unit,
     onCycleRepeat: () -> Unit,
     onToggleAutoplay: () -> Unit,
@@ -618,6 +548,10 @@ fun NowPlayingScreen(
     val context = LocalContext.current
     val density = LocalDensity.current
     val haptics = rememberHaptics()
+    // Kept local to the player: a modal player is not in the page's Haze
+    // source tree, so it needs its own source for the same frosted material as
+    // the bottom navigation pill.
+    val playerHaze = remember { HazeState() }
 
     val syncedLyricsEnabled by AppSettings.syncedLyrics.collectAsStateWithLifecycle()
     val hideVolumeBar by AppSettings.hideVolumeBar.collectAsStateWithLifecycle()
@@ -652,6 +586,10 @@ fun NowPlayingScreen(
         derivedStateOf { canvasCover.floatValue > 0.999f }
     }
     val meshColors = rememberArtworkColors(song.thumbnailUrl, canvasFrame)
+    // Spotify's own Canvas, specifically — see CanvasArtworkPlayer's
+    // refreshFrameEveryMs for why this is scoped to that one source rather
+    // than asked of every clip.
+    val meshRefreshMs = if (canvas?.source == CanvasSource.SPOTIFY) 3_000L else null
     LaunchedEffect(song.videoId, song.albumName, canvasAllowedNow) {
         if (!canvasAllowedNow) {
             canvas = null
@@ -678,7 +616,34 @@ fun NowPlayingScreen(
     // The queue lives inside the player, Apple-style, rather than in a sheet.
     var queueOpen by remember { mutableStateOf(false) }
     var lyricsOpen by remember { mutableStateOf(false) }
-    LaunchedEffect(song.videoId) { lyricsOpen = false }
+    var lyricsLogsOpen by remember { mutableStateOf(false) }
+    val showLyricsLogsEnabled by AppSettings.showLyricsLogs.collectAsStateWithLifecycle()
+    LaunchedEffect(song.videoId) {
+        lyricsOpen = false
+        lyricsLogsOpen = false
+    }
+    // A brief, non-modal confirmation that the three-dot menu now contains a
+    // way back to the original YouTube rendition. The control keeps its usual
+    // action — opening the menu — so the cue teaches rather than surprises.
+    var showRevertCue by remember(song.videoId) { mutableStateOf(false) }
+    LaunchedEffect(song.videoId, qualityUpgraded) {
+        if (!qualityUpgraded) {
+            showRevertCue = false
+            return@LaunchedEffect
+        }
+        showRevertCue = true
+        delay(REVERT_CUE_MS)
+        showRevertCue = false
+    }
+
+    // Lyrics are meant to be read continuously, so prevent the device's
+    // normal screen timeout only while this panel is visible. SideEffect keeps
+    // the view in sync when a new track closes the lyrics panel as well.
+    val playerView = LocalView.current
+    SideEffect { playerView.keepScreenOn = lyricsOpen }
+    DisposableEffect(playerView) {
+        onDispose { playerView.keepScreenOn = false }
+    }
 
     // Back out of the lyrics panel to the player, and only from the player
     // itself out to the mini player.
@@ -698,12 +663,24 @@ fun NowPlayingScreen(
     // that really is dismissing the player. Below 33 there is no window
     // dispatcher to outrank and the BackHandler is already the newest
     // callback on the dialog's, so it wins there unaided.
-    BackHandler(enabled = lyricsOpen) { lyricsOpen = false }
+    BackHandler(enabled = lyricsOpen) {
+        if (lyricsLogsOpen) {
+            lyricsLogsOpen = false
+        } else {
+            lyricsOpen = false
+        }
+    }
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
         val view = LocalView.current
-        DisposableEffect(view, lyricsOpen) {
+        DisposableEffect(view, lyricsOpen, lyricsLogsOpen) {
             val callback = if (lyricsOpen) {
-                OverlayBack.register(view) { lyricsOpen = false }
+                OverlayBack.register(view) {
+                    if (lyricsLogsOpen) {
+                        lyricsLogsOpen = false
+                    } else {
+                        lyricsOpen = false
+                    }
+                }
             } else {
                 null
             }
@@ -851,7 +828,19 @@ fun NowPlayingScreen(
     // Both states collapse the header, but the banner only ever shows over a
     // settled player: opening the queue or the lyrics hands the sleeve back its
     // card first.
-    val p = if (lyricsOpen) 1f else queueProgress
+    // How collapsed the sleeve is, whichever surface asked for it.
+    //
+    // This used to read `if (lyricsOpen) 1f else queueProgress`, which gave the
+    // queue a 420ms ease and the lyrics nothing at all: opening them snapped
+    // the sleeve to a thumbnail in a single frame while [heroT] — reading off
+    // this same value — went on fading the banner out over the full 420. One
+    // half of the artwork jumped, the other half glided after it, and the pair
+    // read as a stutter rather than as either. One animation, both surfaces.
+    val p by animateFloatAsState(
+        targetValue = if (lyricsOpen || queueOpen) 1f else 0f,
+        animationSpec = tween(durationMillis = 420, easing = FastOutSlowInEasing),
+        label = "sleeveCollapse",
+    )
     val fullBleedArt by AppSettings.fullBleedArtwork.collectAsStateWithLifecycle()
     // Full-bleed is a phone idiom, and a docked pane is a phone's width — so it
     // is asked of the player's own width rather than of the window's. Asking the
@@ -876,7 +865,19 @@ fun NowPlayingScreen(
     // Whether there's a still image to blow out — a placeholder tile is a card
     // or it is nothing, and going full-bleed with one would just tint the top
     // third of the screen.
-    var artLoaded by remember(song.videoId) { mutableStateOf(false) }
+    //
+    // Keyed on the artwork rather than on the track, because that is what it
+    // actually describes and because only Coil can set it back to true. Two
+    // tracks off one album share a cover, so skipping between them leaves the
+    // request below byte-identical: the painter keeps the Success it already
+    // had and never re-emits, so the `onState` that is the sole writer here
+    // never fires again. Keyed on the track this reset to false and stayed
+    // there, which pinned the sleeve fully opaque (see the alpha it feeds) on
+    // top of an equally opaque banner — the same cover drawn twice, card and
+    // full-bleed at once. Keyed on the cover there is nothing to reset: the
+    // bitmap really is still loaded, so the state stays true and the two
+    // layers go on trading places as they should.
+    var artLoaded by remember(song.artworkAt(ART_PX)) { mutableStateOf(false) }
     // Sticky, unlike [artLoaded]: the banner is the shape of the player rather
     // than a property of the track in it. Waiting on each new cover would
     // collapse the banner into a card and blow it back out on every skip —
@@ -900,13 +901,35 @@ fun NowPlayingScreen(
     // the clip goes, instead of a frame later with the sleeve behind it still
     // transparent and no artwork anywhere.
     val heroClip = canvas?.takeIf { heroMode && p < 0.5f }
+    // Whether the banner is the presentation at all: full-bleed is on, and there
+    // is something to blow out. The collapse is deliberately *not* part of this
+    // — see [heroVisible].
     val heroT by animateFloatAsState(
         targetValue = if (
-            heroMode && p < 0.5f && (canvasRendered || artLoaded || heroSettled)
+            heroMode && (canvasRendered || artLoaded || heroSettled)
         ) 1f else 0f,
         animationSpec = tween(durationMillis = 420, easing = FastOutSlowInEasing),
         label = "heroCanvas",
     )
+
+    /**
+     * How much of the banner is actually on screen: its own fade, dissolved by
+     * the collapse rather than after it.
+     *
+     * The collapse used to be a threshold on this animation's *target* — the
+     * banner was told to go once [p] passed a half. That chained two 420ms
+     * animations end to end when they should have been the same one: for the
+     * first half of the collapse the banner sat at full size and full opacity
+     * with nothing appearing to move, since the card shrinking behind it is
+     * transparent while the banner is up; then the card finished collapsing and
+     * a full-screen banner cross-dissolved into a finished thumbnail. Two sizes
+     * of the same artwork on screen at once, which is what made every trip in
+     * and out of the lyrics look wrong.
+     *
+     * Multiplied by the collapse instead, the banner goes as the card shrinks:
+     * one movement, and the card is fading in the whole way down.
+     */
+    val heroVisible = heroT * (1f - p)
     // How tall that banner is, worked out down in the layout where the sleeve's
     // own geometry is known. Zero until the first measure, which is fine: there
     // is nothing to show that early either.
@@ -957,7 +980,10 @@ fun NowPlayingScreen(
         // every skip, then rests. Position ticks recompose this screen twice a
         // second and must not drag a full-screen blur along with them, which is
         // why the palette is passed as one immutable value.
-        MeshGradientBackground(palette = meshColors, trackKey = song.videoId)
+        MeshGradientBackground(
+            palette = meshColors,
+            trackKey = song.videoId,
+        )
 
         // The artwork, edge to edge and running up behind the status bar,
         // dissolving into the backdrop where the sleeve's bottom edge would
@@ -985,7 +1011,7 @@ fun NowPlayingScreen(
             // banner straight out leaves a frame or two with no artwork anywhere
             // on screen before the card catches up.
             if (heroMode && !(stillCovered && heroClip != null) &&
-                (p < 0.5f || heroT > 0.001f)
+                (p < 0.5f || heroVisible > 0.001f)
             ) {
                 AsyncImage(
                     // Decoded at the same size the sleeve asks for, so the two
@@ -1003,11 +1029,15 @@ fun NowPlayingScreen(
                         .align(Alignment.TopStart)
                         .fillMaxWidth()
                         .height(heroHeight)
+                        // Haze must observe the drawable layer itself. A
+                        // source on the surrounding layout only captured its
+                        // mesh backdrop, leaving the cover sharp in the pill.
+                        .hazeSource(playerHaze)
                         .graphicsLayer {
                             // Hands its opacity to the clip as the clip takes
                             // over, and takes it straight back if there is no
                             // clip mounted to hand it to.
-                            alpha = heroT *
+                            alpha = heroVisible *
                                 (1f - if (heroClip != null) canvasCover.floatValue else 0f)
                             // The mask below erases part of what this layer
                             // drew, which it can only do in a buffer of its own.
@@ -1030,8 +1060,8 @@ fun NowPlayingScreen(
             // Motion artwork over it, in the same frame.
             //
             // Always composed while there's a clip to play, never gated on
-            // [heroT]: the clip has to be mounted and decoding *before* it can
-            // report the first frame that raises heroT in the first place.
+            // [heroVisible]: the clip has to be mounted and decoding *before*
+            // it can report the first frame that raises heroT in the first place.
             if (heroMode) {
                 heroClip?.let { clip ->
                     CanvasArtworkPlayer(
@@ -1039,12 +1069,14 @@ fun NowPlayingScreen(
                         isPlaying = isPlaying,
                         onRenderedChanged = { canvasRendered = it },
                         onFrameCaptured = { canvasFrame = it },
+                        refreshFrameEveryMs = meshRefreshMs,
                         onCoverChanged = { canvasCover.floatValue = it },
                         bottomFade = HERO_FADE_FRACTION,
                         modifier = Modifier
                             .align(Alignment.TopStart)
                             .fillMaxWidth()
-                            .height(heroHeight),
+                            .height(heroHeight)
+                            .hazeSource(playerHaze),
                     )
                 }
             }
@@ -1054,7 +1086,7 @@ fun NowPlayingScreen(
             // directly behind them — a bright frame or a pale sleeve leaves the
             // top of the screen unreadable. Faded in with the banner and gone
             // with it.
-            if (heroT > 0.01f) {
+            if (heroVisible > 0.01f) {
                 Box(
                     modifier = Modifier
                         .align(Alignment.TopStart)
@@ -1063,7 +1095,7 @@ fun NowPlayingScreen(
                         .background(
                             Brush.verticalGradient(
                                 listOf(
-                                    Color.Black.copy(alpha = 0.38f * heroT),
+                                    Color.Black.copy(alpha = 0.38f * heroVisible),
                                     Color.Transparent,
                                 ),
                             ),
@@ -1121,11 +1153,26 @@ fun NowPlayingScreen(
                 if (!docked) {
                     Box(
                         Modifier
+                            .align(Alignment.TopCenter)
+                            .offset(y = 8.dp)
                             .width(38.dp)
                             .height(5.dp)
                             .clip(RoundedCornerShape(3.dp))
                             .background(Color.White.copy(alpha = 0.32f)),
                     )
+                    song.radioName?.let { radioName ->
+                        Text(
+                            text = stringResource(R.string.playing_radio, radioName),
+                            style = MaterialTheme.typography.labelSmall,
+                            color = Color.White.copy(alpha = 0.78f),
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                            textAlign = TextAlign.Center,
+                            modifier = Modifier
+                                .align(Alignment.BottomCenter)
+                                .padding(start = PLAYER_GUTTER, end = PLAYER_GUTTER, bottom = 1.dp),
+                        )
+                    }
                 }
             }
 
@@ -1230,6 +1277,10 @@ fun NowPlayingScreen(
             // collapses, and re-subscribing to a flow on every frame of that
             // collapse is a waste of a subscription.
             val smartFadeOn by AppSettings.smartFadeEnabled.collectAsStateWithLifecycle()
+            // The scrubber retains its existing transition sheen while a real
+            // Smart Mix is active. This state is independent from the removed
+            // header icon.
+            val mixing by AppSettings.smartMixInProgress.collectAsStateWithLifecycle()
             val smartAnalysis by AppSettings.smartAnalysis.collectAsStateWithLifecycle()
             // Height the artwork block below turns out not to need, spent by the
             // controls at the foot of the screen. Filled in from inside the box,
@@ -1369,7 +1420,12 @@ fun NowPlayingScreen(
                 // it too.
                 Box(
                     modifier = Modifier
-                        .offset(x = artStart, y = artTop)
+                        // The lambda overload deliberately: the Dp one reads
+                        // its arguments at composition, so an animated offset
+                        // recomposes and re-measures this Box — cover, clip and
+                        // all — once per frame. Read at placement instead, the
+                        // same movement costs a placement pass.
+                        .offset { IntOffset(artStart.roundToPx(), artTop.roundToPx()) }
                         .size(artSize)
                         // Where the dismiss band starts. Read here, above the
                         // paused shrink below, so the band covers the sleeve's
@@ -1416,7 +1472,10 @@ fun NowPlayingScreen(
                     Box(
                         modifier = Modifier
                             .fillMaxSize()
-                            .graphicsLayer { alpha = if (artLoaded) 1f - heroT else 1f }
+                            // The compact sleeve is the source while full
+                            // bleed artwork is off, including its Canvas.
+                            .hazeSource(playerHaze)
+                            .graphicsLayer { alpha = if (artLoaded) 1f - heroVisible else 1f }
                             // A drop shadow grounds a photo; on the flat
                             // placeholder tile it has nothing to sit behind, so
                             // it just reads as a second, darker square ringing
@@ -1429,7 +1488,7 @@ fun NowPlayingScreen(
                             .background(Color.Black.copy(alpha = 0.18f)),
                         contentAlignment = Alignment.Center,
                     ) {
-                        if (!artLoaded) {
+                        if (!artLoaded && !canvasRendered) {
                             Icon(
                                 imageVector = BitChordIcons.MusicNote,
                                 contentDescription = null,
@@ -1462,7 +1521,15 @@ fun NowPlayingScreen(
                             // the square sleeve looks like a broken frame.
                             contentScale = ContentScale.Crop,
                             onState = { artLoaded = it is AsyncImagePainter.State.Success },
-                            modifier = Modifier.fillMaxSize(),
+                            // TextureView-backed canvas frames can arrive
+                            // before Coil has decoded the sleeve. Hide the
+                            // still layer for that short window: on some
+                            // devices Compose draws the image placeholder over
+                            // the Android view, leaving a blank square on top
+                            // of a perfectly healthy animated cover.
+                            modifier = Modifier
+                                .fillMaxSize()
+                                .graphicsLayer { alpha = if (!artLoaded && canvasRendered) 0f else 1f },
                         )
 
                         // Where the clip plays when it can't have the banner:
@@ -1475,6 +1542,7 @@ fun NowPlayingScreen(
                                     isPlaying = isPlaying,
                                     onRenderedChanged = { canvasRendered = it },
                                     onFrameCaptured = { canvasFrame = it },
+                                    refreshFrameEveryMs = meshRefreshMs,
                                     modifier = Modifier.fillMaxSize(),
                                 )
                             }
@@ -1507,7 +1575,7 @@ fun NowPlayingScreen(
                                 .padding(horizontal = 10.dp, vertical = 8.dp)
                                 .graphicsLayer { alpha = 1f - p * 2f },
                         ) {
-                            nerdStats?.describe()?.let { stats ->
+                            nerdStats?.describe(context)?.let { stats ->
                                 Text(
                                     text = stats,
                                     style = nerdStyle,
@@ -1526,9 +1594,15 @@ fun NowPlayingScreen(
                                     // agree, so the line reads the same way every
                                     // time and the eye can find the half it wants
                                     // without re-parsing the sentence.
-                                    text = "Automix · this song " +
-                                        smartAnalysis.current.label() +
-                                        " · next " + smartAnalysis.next.label(),
+                                    text = if (song.isVideoOrigin) {
+                                        stringResource(R.string.automix_not_supported_video)
+                                    } else {
+                                        stringResource(
+                                            R.string.automix_analysis_status,
+                                            smartAnalysis.current.localizedLabel(),
+                                            smartAnalysis.next.localizedLabel(),
+                                        )
+                                    },
                                     style = nerdStyle,
                                     // Dimmer than the measured line above it: that
                                     // one describes the audio, this one describes
@@ -1541,6 +1615,22 @@ fun NowPlayingScreen(
                             }
                         }
                     }
+                }
+
+                // Video uploads begin as their own audio, immediately. This
+                // frosted, pill-shaped control is the one explicit opt-in to a
+                // catalogue match; after a successful swap it becomes Revert
+                // so a bad match is one tap away from the original upload.
+                if ((song.isVideo || isAudioVersion) && !lyricsOpen && p < 0.5f) {
+                    VideoAudioVersionButton(
+                        audioVersion = isAudioVersion,
+                        loading = audioVersionSwitching,
+                        onClick = onToggleAudioVersion,
+                        hazeState = playerHaze,
+                        modifier = Modifier
+                            .align(Alignment.TopCenter)
+                            .offset(y = artTop - 20.dp),
+                    )
                 }
 
                 // Sits in the gap under the sleeve, clear of its rounded
@@ -1591,14 +1681,12 @@ fun NowPlayingScreen(
                         // Shrinks as the header collapses, so the queue's
                         // heading doesn't have to compete with it.
                         val titleSize = lerp(20.sp, 16.sp, p)
-                        Text(
-                            text = song.title,
+                        ExplicitSongTitle(
+                            song = song,
                             style = MaterialTheme.typography.titleLarge.copy(
                                 fontSize = titleSize,
                             ),
                             color = Color.White,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis,
                             // Only the tracks YouTube hands us a browse id for
                             // lead anywhere; the rest stay plain text.
                             modifier = Modifier.opensPage(song.albumId, onOpenAlbum),
@@ -1626,7 +1714,9 @@ fun NowPlayingScreen(
                         val liked = likeStatus == LikeStatus.LIKE
                         CircleGlyph(
                             icon = if (liked) BitChordIcons.HeartFilled else BitChordIcons.Heart,
-                            contentDescription = if (liked) "Remove from Liked Music" else "Like",
+                            contentDescription = stringResource(
+                                if (liked) R.string.remove_from_liked else R.string.like,
+                            ),
                             onClick = onToggleLike,
                             active = liked,
                             haptic = if (liked) Haptic.ToggleOff else Haptic.ToggleOn,
@@ -1634,22 +1724,46 @@ fun NowPlayingScreen(
                         Spacer(Modifier.width(8.dp))
                     }
                     CircleGlyph(
-                        icon = Icons.Rounded.MoreHoriz,
-                        contentDescription = "More",
+                        icon = if (showRevertCue) Icons.AutoMirrored.Rounded.Undo else Icons.Rounded.MoreHoriz,
+                        contentDescription = stringResource(R.string.more),
                         onClick = onOpenMenu,
                     )
                 }
 
                 if (lyricsOpen) {
-                    LyricsPanel(
-                        lines = lyrics.orEmpty(),
-                        positionMs = positionMs,
-                        isPlaying = isPlaying,
-                        onSeekToLine = onSeek,
-                        modifier = Modifier
-                            .fillMaxSize()
-                            .padding(top = HEADER_HEIGHT + 10.dp),
-                    )
+                    if (lyricsLogsOpen) {
+                        // Full-screen log console — replaces the lyrics list while
+                        // the debug panel is open. Same fade-in timing as the lyrics
+                        // panel so the transition is identical from the user's side.
+                        LyricsLogConsole(
+                            modifier = Modifier
+                                .fillMaxSize()
+                                .padding(top = HEADER_HEIGHT + 10.dp)
+                                .graphicsLayer {
+                                    alpha = ((p - 0.45f) / 0.55f).coerceIn(0f, 1f)
+                                    translationY = (1f - p) * 26.dp.toPx()
+                                },
+                        )
+                    } else {
+                        LyricsPanel(
+                            lines = lyrics.orEmpty(),
+                            positionMs = positionMs,
+                            isPlaying = isPlaying,
+                            onSeekToLine = onSeek,
+                            modifier = Modifier
+                                .fillMaxSize()
+                                .padding(top = HEADER_HEIGHT + 10.dp)
+                                // Arrives once the sleeve has finished collapsing
+                                // into the header, the same beat the queue below
+                                // already waits for — fading lyrics in over a
+                                // sleeve still mid-collapse doubled the same
+                                // movement in two places on screen at once.
+                                .graphicsLayer {
+                                    alpha = ((p - 0.45f) / 0.55f).coerceIn(0f, 1f)
+                                    translationY = (1f - p) * 26.dp.toPx()
+                                },
+                        )
+                    }
                 }
 
                 // Toggles and the queue arrive after the sleeve has finished
@@ -1690,9 +1804,11 @@ fun NowPlayingScreen(
                 horizontalAlignment = Alignment.CenterHorizontally,
             ) {
             // Current lyric, one line, directly above the scrubber. It stays in
-            // the layout while the queue is open and only fades — dropping it
-            // would shorten this block, and the controls under it would jump
-            // the moment the queue started sliding in.
+            // the layout — and stays fully visible — whether or not the queue
+            // is open: dropping it would shorten this block and the controls
+            // under it would jump the moment the queue started sliding in, and
+            // fading it away behind the queue left this the one place in the
+            // player where the current line simply vanished.
             //
             // Switched off in Settings it goes entirely, rather than sitting
             // there saying no lyrics were found: none were looked for. It is
@@ -1706,8 +1822,7 @@ fun NowPlayingScreen(
                         // drawn bar, so the strip reads as further off it than
                         // it is. Nudged down into that dead space, the same way
                         // the timestamps below are pulled back up into it.
-                        .offset(y = 6.dp)
-                        .graphicsLayer { alpha = 1f - queueProgress },
+                        .offset(y = 6.dp),
                 ) {
                     if (!lyrics.isNullOrEmpty()) {
                         CurrentLyricLine(
@@ -1716,9 +1831,14 @@ fun NowPlayingScreen(
                             positionMs = positionMs,
                             isPlaying = isPlaying,
                             durationMs = durationMs,
-                            // Faded out behind the queue, so it must not still
-                            // be a target for a tap meant for the list.
-                            onClick = { if (!queueOpen) lyricsOpen = true },
+                            // Still visible over the queue, so still a valid way
+                            // in: opens the same full lyrics panel it always has,
+                            // closing the queue behind it the same way the "Up
+                            // next" glyph closes lyrics behind the queue.
+                            onClick = {
+                                queueOpen = false
+                                lyricsOpen = true
+                            },
                             modifier = Modifier.fillMaxWidth(),
                         )
                     } else if (lyricsUnavailable) {
@@ -1734,7 +1854,6 @@ fun NowPlayingScreen(
                     }
                 }
             }
-            val mixing by AppSettings.smartMixInProgress.collectAsStateWithLifecycle()
             val transitionWindow by AppSettings.smartTransitionWindow.collectAsStateWithLifecycle()
             ThinSlider(
                 value = shown,
@@ -1763,7 +1882,6 @@ fun NowPlayingScreen(
                     ?.takeIf { !scrubbing && it.end > it.start }
                     ?.let { it.start..it.end },
             )
-            val losslessOn by AppSettings.losslessAudio.collectAsStateWithLifecycle()
             val wifiQuality by AppSettings.audioQualityWifi.collectAsStateWithLifecycle()
             val cellularQuality by AppSettings.audioQualityCellular.collectAsStateWithLifecycle()
             val metered by AppSettings.meteredConnection.collectAsStateWithLifecycle()
@@ -1772,8 +1890,8 @@ fun NowPlayingScreen(
             // makes, mirrored here so "Loading lossless" only appears when a
             // lossless fetch is actually in flight, not on every buffering
             // YouTube track.
-            val losslessRequested = losslessOn &&
-                (if (metered == true) cellularQuality else wifiQuality) == AudioQuality.HIGH
+            val losslessRequested =
+                (if (metered == true) cellularQuality else wifiQuality) == AudioQuality.LOSSLESS
             // Whether a module is still racing YouTube for this exact track —
             // see [NerdStats.racingLossless]. YouTube can win that race and
             // already be playing while the module lookup is still running
@@ -1822,31 +1940,63 @@ fun NowPlayingScreen(
 
             if (lyricsOpen) {
                 Spacer(Modifier.height(16.dp))
-                // The credit, and beside it the way out. Tapping the sleeve
-                // above also closes the panel, but that is an invisible target
-                // you have to be told about; the button says so. With four
-                // databases behind the panel, whose timings you are looking at
-                // is worth the room the credit takes next to it.
+                // Full-width header row: optional logs icon on the far left,
+                // source credit pill in the middle, close circle on the right.
+                // The row stretches edge-to-edge so there is no dangling gap
+                // on either side — the pill just sits between the two icons.
                 Row(
-                    // Measured at the pill's own height so the button can be
-                    // sized off it rather than off a number that happens to
-                    // match today: the pill is as tall as the label's line
-                    // height plus its padding, which moves with the font scale,
-                    // and the circle has to keep matching it when it does.
-                    modifier = Modifier.height(IntrinsicSize.Min),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(IntrinsicSize.Min),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
+                    // Logs icon — only shown when the debug-log setting is on
+                    // (Advanced Options in Settings). Icon-only, no label.
+                    if (showLyricsLogsEnabled) {
+                        Box(
+                            modifier = Modifier
+                                .fillMaxHeight()
+                                .aspectRatio(1f, matchHeightConstraintsFirst = true)
+                                .clip(CircleShape)
+                                .background(if (lyricsLogsOpen) Color.White.copy(alpha = 0.22f) else Color.White.copy(alpha = 0.10f))
+                                .clickable(
+                                    interactionSource = remember { MutableInteractionSource() },
+                                    indication = null,
+                                ) {
+                                    haptics.play(Haptic.Tap)
+                                    lyricsLogsOpen = !lyricsLogsOpen
+                                },
+                            contentAlignment = Alignment.Center,
+                        ) {
+                            Icon(
+                                imageVector = Icons.Rounded.History,
+                                contentDescription = "Lyrics Logs",
+                                tint = if (lyricsLogsOpen) Color(0xFFFFD54F) else Color.White.copy(alpha = 0.8f),
+                                modifier = Modifier.size(16.dp),
+                            )
+                        }
+                        Spacer(Modifier.width(8.dp))
+                    }
+                    // Source credit pill — same style as original, but sits between
+                    // the two icon buttons and fills leftover horizontal space.
                     Box(
                         modifier = Modifier
+                            .weight(1f)
                             .clip(RoundedCornerShape(percent = 50))
                             .background(Color.White.copy(alpha = 0.10f))
                             .padding(horizontal = 18.dp, vertical = 8.dp),
+                        contentAlignment = Alignment.Center,
                     ) {
                         Text(
-                            text = lyricsSource?.let { "Lyrics by ${it.label}" }
-                                ?: "No lyrics found",
+                            text = when {
+                                lyricsSource != null -> stringResource(R.string.lyrics_by, lyricsSource.label)
+                                lyrics.isNullOrEmpty() -> stringResource(R.string.no_lyrics_found)
+                                else -> stringResource(R.string.lyrics_saved_with_download)
+                            },
                             style = MaterialTheme.typography.labelLarge,
                             color = Color.White.copy(alpha = 0.7f),
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
                         )
                     }
                     Spacer(Modifier.width(8.dp))
@@ -1863,13 +2013,14 @@ fun NowPlayingScreen(
                                 indication = null,
                             ) {
                                 haptics.play(Haptic.Tap)
+                                lyricsLogsOpen = false
                                 lyricsOpen = false
                             },
                         contentAlignment = Alignment.Center,
                     ) {
                         Icon(
                             imageVector = Icons.Rounded.Close,
-                            contentDescription = "Close lyrics",
+                            contentDescription = stringResource(R.string.close_lyrics),
                             tint = Color.White.copy(alpha = 0.7f),
                             modifier = Modifier.size(16.dp),
                         )
@@ -1893,7 +2044,7 @@ fun NowPlayingScreen(
             ) {
                 TransportGlyph(
                     icon = Icons.Rounded.FastRewind,
-                    contentDescription = "Previous",
+                    contentDescription = stringResource(R.string.widget_previous),
                     size = 46.dp,
                     onClick = onPrevious,
                     // Lit whenever back has something to do — either a track to
@@ -1916,7 +2067,7 @@ fun NowPlayingScreen(
                 } else {
                     TransportGlyph(
                         icon = if (isPlaying) Icons.Rounded.Pause else Icons.Rounded.PlayArrow,
-                        contentDescription = if (isPlaying) "Pause" else "Play",
+                        contentDescription = stringResource(if (isPlaying) R.string.pause else R.string.play),
                         size = 62.dp,
                         onClick = onPlayPause,
                         haptic = if (isPlaying) Haptic.Pause else Haptic.Resume,
@@ -1924,7 +2075,7 @@ fun NowPlayingScreen(
                 }
                 TransportGlyph(
                     icon = Icons.Rounded.FastForward,
-                    contentDescription = "Next",
+                    contentDescription = stringResource(R.string.widget_next),
                     size = 46.dp,
                     onClick = onNext,
                     enabled = hasNext,
@@ -1992,7 +2143,9 @@ fun NowPlayingScreen(
             ) {
                 BottomGlyph(
                     icon = BitChordIcons.Shuffle,
-                    contentDescription = if (shuffleEnabled) "Shuffle on" else "Shuffle off",
+                    contentDescription = stringResource(
+                        if (shuffleEnabled) R.string.shuffle_on else R.string.shuffle_off,
+                    ),
                     onClick = onToggleShuffle,
                     highlighted = shuffleEnabled,
                     haptic = if (shuffleEnabled) Haptic.ToggleOff else Haptic.ToggleOn,
@@ -2001,9 +2154,9 @@ fun NowPlayingScreen(
                     icon = if (repeatMode == Player.REPEAT_MODE_ONE) null else BitChordIcons.Repeat,
                     label = if (repeatMode == Player.REPEAT_MODE_ONE) "1" else null,
                     contentDescription = when (repeatMode) {
-                        Player.REPEAT_MODE_ONE -> "Repeat one"
-                        Player.REPEAT_MODE_ALL -> "Repeat all"
-                        else -> "Repeat off"
+                        Player.REPEAT_MODE_ONE -> stringResource(R.string.repeat_one)
+                        Player.REPEAT_MODE_ALL -> stringResource(R.string.repeat_all)
+                        else -> stringResource(R.string.repeat_off)
                     },
                     onClick = onCycleRepeat,
                     highlighted = repeatMode != Player.REPEAT_MODE_OFF,
@@ -2018,14 +2171,16 @@ fun NowPlayingScreen(
                 )
                 BottomGlyph(
                     icon = BitChordIcons.Infinity,
-                    contentDescription = if (autoplayEnabled) "AutoPlay on" else "AutoPlay off",
+                    contentDescription = stringResource(
+                        if (autoplayEnabled) R.string.autoplay_on else R.string.autoplay_off,
+                    ),
                     onClick = onToggleAutoplay,
                     highlighted = autoplayEnabled,
                     haptic = if (autoplayEnabled) Haptic.ToggleOff else Haptic.ToggleOn,
                 )
                 BottomGlyph(
                     icon = Icons.AutoMirrored.Rounded.QueueMusic,
-                    contentDescription = "Up next",
+                    contentDescription = stringResource(R.string.up_next),
                     onClick = {
                         lyricsOpen = false
                         queueOpen = !queueOpen
@@ -2128,9 +2283,19 @@ private suspend fun AwaitPointerEventScope.dragQueueIn(
 @Composable
 private fun rememberLyricClock(positionMs: Long, isPlaying: Boolean): MutableLongState {
     val clock = remember { mutableLongStateOf(positionMs) }
-    LaunchedEffect(positionMs, isPlaying) {
+    // Gated on the app being on screen. The loop asks for a frame, writes a
+    // value that invalidates a drawing, and is handed the next frame for it —
+    // which is a request to render continuously for as long as it runs. That is
+    // the right trade for a lyric being read and the wrong one for a phone in a
+    // pocket, and the composition alone cannot tell the two apart.
+    //
+    // Resuming needs no catch-up: [positionMs] is a key, so coming back
+    // restarts the effect and the clock is set from the player's own position
+    // before the first frame is asked for.
+    val foreground = rememberIsForeground()
+    LaunchedEffect(positionMs, isPlaying, foreground) {
         clock.longValue = positionMs
-        if (!isPlaying) return@LaunchedEffect
+        if (!isPlaying || !foreground) return@LaunchedEffect
         var previousFrame = withFrameMillis { it }
         while (true) {
             withFrameMillis { frame ->
@@ -2392,47 +2557,38 @@ private fun LyricsPanel(
 ) {
     val clock = rememberLyricClock(positionMs, isPlaying)
 
+    val isSynced = remember(lines) { lines.any { it.timeMs > 0L } }
+
     // Which line is playing right now: the last one whose stamp has passed.
-    //
-    // Read off the frame clock rather than the player's own position, which
-    // only lands twice a second. Taken from there, a line change was up to
-    // half a second late — and with the highlight itself running on the frame
-    // clock, that lateness was visible: the sweep would finish a line and sit
-    // at the end of it, waiting for the screen to admit the next one had
-    // started. derivedStateOf keeps the cost of the finer clock off
-    // composition; it only notifies when the index actually changes, not on
-    // every frame that feeds it.
-    val activeLine by remember(lines) {
-        derivedStateOf { lines.indexOfLast { it.timeMs <= clock.longValue } }
+    val activeLine by remember(lines, isSynced) {
+        derivedStateOf {
+            if (!isSynced) -1 else lines.indexOfLast { it.timeMs <= clock.longValue }
+        }
+    }
+    val alsoActive by remember(lines, isSynced) {
+        derivedStateOf {
+            if (!isSynced) return@derivedStateOf -1
+            val previous = activeLine - 1
+            val line = lines.getOrNull(previous)
+            if (line != null && line.hasKnownEnd && clock.longValue < line.endMs) previous else -1
+        }
     }
     val listState = rememberLazyListState()
     val keepScroll = remember(listState) { keepScrollInList(listState) }
     var browsing by remember { mutableStateOf(false) }
     val reduceDynamicBlur by AppSettings.reduceDynamicBlur.collectAsStateWithLifecycle()
+    val lyricsBlur by AppSettings.lyricsBlur.collectAsStateWithLifecycle()
     val reduceAnimation by AppSettings.reduceAnimation.collectAsStateWithLifecycle()
 
-    // The bloom is a blurred copy of the line, so it is off wherever blur is:
-    // below API 31 Modifier.blur does nothing and the "glow" would land as a
-    // second sharp copy of the text — fake bold, not light. Both of the
-    // reduce-* settings turn it off too. Reduce animation because it is the
-    // switch for exactly this kind of flourish, and reduce dynamic blur
-    // because adding a blur under a setting that says it drops them would be
-    // the app disagreeing with itself.
-    val glowing = !reduceAnimation && !reduceDynamicBlur &&
+    val glowing = !reduceAnimation && !reduceDynamicBlur && lyricsBlur &&
         Build.VERSION.SDK_INT >= Build.VERSION_CODES.S
 
-    // Only a finger on the list counts as browsing — watching
-    // isScrollInProgress would trip on our own auto-scroll.
     LaunchedEffect(listState) {
         listState.interactionSource.interactions.collect { interaction ->
             if (interaction is DragInteraction.Start) browsing = true
         }
     }
 
-    // Hand control back as soon as the playing line is on screen again,
-    // whether the user scrolled to it or the song caught up to them.
-    // rememberUpdatedState matters: read plainly, the derived state would
-    // capture whichever line was active when it was first created.
     val currentLine by rememberUpdatedState(activeLine)
     val activeOnScreen by remember(listState) {
         derivedStateOf {
@@ -2446,7 +2602,6 @@ private fun LyricsPanel(
         }
     }
 
-    // And give up browsing on its own after a while, wherever the list is.
     LaunchedEffect(browsing, listState.isScrollInProgress) {
         if (browsing && !listState.isScrollInProgress) {
             delay(5_000)
@@ -2454,31 +2609,11 @@ private fun LyricsPanel(
         }
     }
 
-    // Follow the song, keeping the active line a third of the way down.
-    //
-    // Gated on isScrollInProgress as well as browsing: browsing flips true from
-    // a Flow collecting DragInteraction.Start, which lags a frame or two behind
-    // the actual touch. A line change landing in that gap started this
-    // animated scroll underneath a finger already dragging, and the ensuing
-    // fight over the list's MutatorMutex was what leaked a stray scroll past
-    // keepScrollInList and down to the sheet — reading the list's own
-    // (synchronous) scroll state closes that window.
-    //
-    // The very first placement is a jump, not a scroll. The panel is built
-    // fresh each time it is opened, so an animated scroll there is the whole
-    // song racing past from the top before settling — which is where the
-    // stutter on opening came from. Later moves, which are one line at a time,
-    // still animate.
     var placed by remember(lines) { mutableStateOf(false) }
     LaunchedEffect(activeLine, browsing) {
-        if (!browsing && !listState.isScrollInProgress &&
+        if (isSynced && !browsing && !listState.isScrollInProgress &&
             activeLine >= 0 && activeLine in lines.indices
         ) {
-            // A third of the way down the panel, whatever the panel's size — a
-            // fixed pixel offset lands in a different place on every screen,
-            // and on a tablet it put the playing line near the very top.
-            // Measured height is 0 until the list has been laid out once,
-            // which on the opening frame is exactly when this runs.
             val viewport = snapshotFlow { listState.layoutInfo.viewportSize.height }
                 .first { it > 0 }
             val third = viewport / 3
@@ -2494,7 +2629,7 @@ private fun LyricsPanel(
     if (lines.isEmpty()) {
         Box(modifier, contentAlignment = Alignment.Center) {
             Text(
-                text = "No lyrics for this track",
+                text = stringResource(R.string.no_lyrics_for_track),
                 style = MaterialTheme.typography.titleMedium,
                 color = Color.White.copy(alpha = 0.6f),
             )
@@ -2518,25 +2653,59 @@ private fun LyricsPanel(
         verticalArrangement = Arrangement.spacedBy(0.dp),
     ) {
         itemsIndexed(lines) { index, line ->
-            val distance = if (activeLine < 0) 0 else abs(index - activeLine)
-            val isActive = index == activeLine
-            // Unbounded, and ahead of the clip: the default edge treatment cuts
-            // the blur off at the line's own box, which put a hard edge down
-            // either side of every out-of-focus line where the halo should have
-            // faded out. The list bleeds a gutter wider than its content
-            // padding, so there is room for the spill.
+            if (!isSynced && Genius.isSectionHeader(line.text)) {
+                val sectionTitle = line.text.removePrefix("[").removeSuffix("]").trim()
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(top = if (index == 0) 6.dp else 24.dp, bottom = 8.dp)
+                        .padding(horizontal = GLOW_ROOM),
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(6.dp))
+                            .background(Color.White.copy(alpha = 0.14f))
+                            .padding(horizontal = 11.dp, vertical = 4.dp),
+                    ) {
+                        Text(
+                            text = sectionTitle.uppercase(),
+                            style = MaterialTheme.typography.labelMedium.copy(
+                                letterSpacing = 1.3.sp,
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 11.5.sp,
+                            ),
+                            color = Color.White.copy(alpha = 0.9f),
+                        )
+                    }
+                }
+                return@itemsIndexed
+            }
+
+            if (!isSynced && line.isGap) {
+                Spacer(Modifier.height(14.dp))
+                return@itemsIndexed
+            }
+
+            val offset = if (activeLine < 0) 0 else index - activeLine
+            val distance = abs(offset)
+            val isActive = isSynced && (index == activeLine || index == alsoActive)
             val blur by animateDpAsState(
                 targetValue = when {
-                    reduceDynamicBlur || browsing || isActive -> 0.dp
+                    !isSynced || reduceDynamicBlur || !lyricsBlur || browsing || isActive -> 0.dp
                     else -> (distance * 1.6f).coerceAtMost(7f).dp
                 },
                 label = "lyricBlur",
             )
             val lineAlpha by animateFloatAsState(
                 targetValue = when {
-                    browsing -> 1f
+                    !isSynced -> 0.95f
                     isActive -> 1f
-                    else -> (0.5f - distance * 0.06f).coerceAtLeast(0.22f)
+                    browsing -> if (offset < 0)
+                        (0.55f - distance * 0.05f).coerceAtLeast(0.30f)
+                    else
+                        (0.45f - distance * 0.09f).coerceAtLeast(0.12f)
+                    offset < 0 -> (0.55f - distance * 0.05f).coerceAtLeast(0.30f)
+                    else -> (0.45f - distance * 0.09f).coerceAtLeast(0.12f)
                 },
                 label = "lyricAlpha",
             )
@@ -2547,22 +2716,30 @@ private fun LyricsPanel(
                 )
                 Icon(
                     imageVector = BitChordIcons.MusicNote,
-                    contentDescription = "Instrumental",
+                    contentDescription = stringResource(R.string.instrumental),
                     tint = Color.White.copy(alpha = lineAlpha),
                     modifier = Modifier
                         .blur(blur, BlurredEdgeTreatment.Unbounded)
                         .clip(RoundedCornerShape(10.dp))
-                        .clickable { onSeekToLine(line.timeMs) }
+                        .clickable(enabled = isSynced) { onSeekToLine(line.timeMs) }
                         // Matches the inset every sung line carries, so the
                         // rhythm of the list doesn't break at a break.
                         .padding(GLOW_ROOM)
                         .size(noteSize),
                 )
             } else {
-                val style = MaterialTheme.typography.headlineLarge.copy(
-                    fontSize = 27.sp,
-                    lineHeight = 33.sp,
-                )
+                val style = if (isSynced) {
+                    MaterialTheme.typography.headlineLarge.copy(
+                        fontSize = 27.sp,
+                        lineHeight = 33.sp,
+                    )
+                } else {
+                    MaterialTheme.typography.headlineMedium.copy(
+                        fontSize = 23.sp,
+                        lineHeight = 31.sp,
+                        fontWeight = FontWeight.SemiBold,
+                    )
+                }
                 // The playing line swells a touch. Anchored to its left edge,
                 // so the words don't slide sideways under the highlight as it
                 // grows — scaling about the centre would fight the sweep.
@@ -2588,44 +2765,149 @@ private fun LyricsPanel(
                     }
                     .blur(blur, BlurredEdgeTreatment.Unbounded)
                     .clip(RoundedCornerShape(10.dp))
-                    .clickable { onSeekToLine(line.timeMs) }
-                if (line.isWordSynced && !browsing) {
-                    // Every word-synced line goes through the sweep, not just
-                    // the playing one — a line that has already been sung is
-                    // fully revealed and one still to come is not, which falls
-                    // out of the same arithmetic.
-                    //
-                    // Running it only on the active line meant swapping this
-                    // composable for a plain Text the instant a line handed
-                    // over, and the two disagreed about the brightness of the
-                    // words: the tail of the line popped up to meet the rest of
-                    // it in a single frame. Animating the tail instead lets a
-                    // finished line close up as it dims away.
-                    val tail by animateFloatAsState(
-                        targetValue = if (isActive) UNSUNG_ALPHA else 1f,
-                        label = "lyricTail",
-                    )
-                    SweptLyricLine(
+                    .clickable(enabled = isSynced) { onSeekToLine(line.timeMs) }
+                // Lead and answering vocal are one row: they are one line of
+                // the song, they scale and dim together, and tapping either
+                // seeks to the same place.
+                Column(modifier = shape) {
+                    PanelVoice(
                         line = line,
                         clock = clock,
                         style = style,
-                        dimAlpha = tail,
-                        modifier = shape,
+                        isActive = isActive,
+                        browsing = browsing,
                         glowAlpha = glow,
-                        glowRoom = GLOW_ROOM,
+                        room = GLOW_ROOM,
+                        modifier = Modifier.fillMaxWidth(),
                     )
-                } else {
-                    Text(
-                        text = line.text,
-                        style = style,
-                        color = Color.White,
-                        modifier = shape.padding(GLOW_ROOM),
-                    )
+                    line.background?.let { backing ->
+                        PanelVoice(
+                            line = backing.withoutBracketPunctuation(),
+                            clock = clock,
+                            style = style.copy(
+                                fontSize = BACKING_FONT_SIZE,
+                                lineHeight = BACKING_LINE_HEIGHT,
+                            ),
+                            isActive = isActive,
+                            browsing = browsing,
+                            // No bloom on the second voice. The glow marks
+                            // what is being sung *at you*; putting it on both
+                            // makes the row read as two equal lines, which is
+                            // the thing this split exists to stop.
+                            glowAlpha = 0f,
+                            room = 0.dp,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                // No top inset: the lead's own bottom room is
+                                // the gap, which leaves the two voices closer
+                                // to each other than to the rows either side.
+                                .padding(start = GLOW_ROOM, end = GLOW_ROOM, bottom = GLOW_ROOM)
+                                .graphicsLayer { alpha = BACKING_ALPHA },
+                        )
+                    }
                 }
             }
         }
     }
 }
+
+
+/**
+ * One voice of a row in [LyricsPanel] — the lead, or the answering line drawn
+ * under it.
+ *
+ * Both go through the same sweep. A backing vocal carries its own word
+ * timings, so it lights up on its own clock rather than borrowing the lead's:
+ * that is the whole point of splitting it out, and it is why the bracket no
+ * longer gets cut off when the next line's stamp arrives mid-phrase.
+ */
+@Composable
+private fun PanelVoice(
+    line: LyricLine,
+    clock: MutableLongState,
+    style: TextStyle,
+    isActive: Boolean,
+    browsing: Boolean,
+    glowAlpha: Float,
+    room: Dp,
+    modifier: Modifier = Modifier,
+) {
+    if (line.isWordSynced && !browsing) {
+        // Every word-synced line goes through the sweep, not just the playing
+        // one — a line that has already been sung is fully revealed and one
+        // still to come is not, which falls out of the same arithmetic.
+        //
+        // Running it only on the active line meant swapping this composable
+        // for a plain Text the instant a line handed over, and the two
+        // disagreed about the brightness of the words: the tail of the line
+        // popped up to meet the rest of it in a single frame. Animating the
+        // tail instead lets a finished line close up as it dims away.
+        val tail by animateFloatAsState(
+            targetValue = if (isActive) UNSUNG_ALPHA else 1f,
+            label = "lyricTail",
+        )
+        SweptLyricLine(
+            line = line,
+            clock = clock,
+            style = style,
+            dimAlpha = tail,
+            modifier = modifier,
+            glowAlpha = glowAlpha,
+            glowRoom = room,
+        )
+    } else if (line.isWordSynced) {
+        // Browsing: keep the sweep so sung lines stay fully lit and unsung
+        // ones stay dim, but skip the bloom — it is a playback flourish, not
+        // a browsing aid.  Non-active lines get the same dim tail as when we
+        // are not browsing; the active line stays at full brightness.
+        val tail by animateFloatAsState(
+            targetValue = if (isActive) UNSUNG_ALPHA else 1f,
+            label = "lyricTail",
+        )
+        SweptLyricLine(
+            line = line,
+            clock = clock,
+            style = style,
+            dimAlpha = tail,
+            modifier = modifier,
+            glowAlpha = 0f,
+            glowRoom = room,
+        )
+    } else {
+        // Non word-synced: during playback the sweep is not available so we
+        // rely on graphicsLayer alpha (set by the parent) to dim inactive
+        // lines.  During browsing the same rule applies — do not default to
+        // full white.
+        Text(
+            text = line.text,
+            style = style,
+            color = Color.White,
+            modifier = modifier.padding(room),
+        )
+    }
+}
+
+/**
+ * The answering vocal without the parentheses every text-only source wraps it
+ * in — see [withBackgroundVocals]. Apple Music draws its own equivalent line
+ * bare, and the brackets were only ever there to mark the split before there
+ * was a row of its own to draw it on.
+ *
+ * The LRC writer still gets the line with its brackets: that punctuation is
+ * what the provider published, so a downloaded file keeps it. This is a
+ * display-only trim, done here rather than in the data layer, and applied to
+ * the words too, not just [LyricLine.text] — [SweptLyricLine] measures the
+ * words against the text it draws, and a sweep reading "(echoed" against a
+ * line reading "echoed" would search for a substring that is no longer there.
+ */
+private fun LyricLine.withoutBracketPunctuation(): LyricLine = copy(
+    text = text.stripParens(),
+    words = words.mapNotNull { word ->
+        word.text.stripParens().takeIf { it.isNotEmpty() }?.let { word.copy(text = it) }
+    },
+)
+
+private fun String.stripParens(): String = replace("(", "").replace(")", "").trim()
 
 
 /**
@@ -2651,6 +2933,36 @@ private fun CurrentLyricLine(
     onClick: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
+    val isSynced = remember(lines) { lines.any { it.timeMs > 0L } }
+    if (!isSynced) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = modifier
+                .clip(RoundedCornerShape(8.dp))
+                .clickable(onClick = onClick)
+                .padding(vertical = 4.dp),
+        ) {
+            Icon(
+                imageVector = BitChordIcons.MusicNote,
+                contentDescription = null,
+                tint = Color.White.copy(alpha = 0.85f),
+                modifier = Modifier.size(16.dp),
+            )
+            Spacer(Modifier.width(8.dp))
+            Text(
+                text = "Lyrics available • Tap to view",
+                style = MaterialTheme.typography.bodyMedium.copy(
+                    fontSize = 13.5.sp,
+                    fontWeight = FontWeight.Medium,
+                ),
+                color = Color.White.copy(alpha = 0.85f),
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+        return
+    }
+
     val clock = rememberLyricClock(positionMs, isPlaying)
 
     val index by remember(lines) {
@@ -2664,10 +2976,20 @@ private fun CurrentLyricLine(
     val firstSung = remember(lines) { lines.indexOfFirst { !it.isGap } }
     val intro = instrumental && firstSung >= 0 && index < firstSung
     // The intro gets one of the slang lines; mid-song breaks stay plain.
-    val introLine = remember(trackKey) { INTRO_LINES.random() }
+    val introLines = stringArrayResource(R.array.lyrics_intro_lines)
+    // `stringArrayResource` may return a new array on every recomposition.
+    // Keying this selection to that array made the intro copy change whenever
+    // the playback clock recomposed the strip. Pick it once for this track.
+    val introLine = remember(trackKey) { introLines.random() }
+    // The strip is one line and switches the moment the next one is due, so
+    // the answering vocal — where there is one — has nowhere to go: showing
+    // it would mean either cutting it short when the next line arrives or
+    // holding the strip back and leaving a gap before the next line's own
+    // words appear. [LyricsPanel] has the room to draw it properly; here it
+    // is simply left off, same as before this line had a bracket in it.
     val text = when {
         intro -> introLine
-        instrumental -> INSTRUMENTAL_MARK
+        instrumental -> stringResource(R.string.instrumental)
         else -> current!!.text
     }
 
@@ -2752,7 +3074,7 @@ private fun LyricsUnavailableLine(trackKey: Any, modifier: Modifier = Modifier) 
         label = "lyricsUnavailableAlpha",
     )
     Text(
-        text = "Lyrics not available",
+        text = stringResource(R.string.lyrics_not_available),
         style = MaterialTheme.typography.titleMedium,
         color = Color.White,
         maxLines = 1,
@@ -2766,7 +3088,10 @@ private fun LyricsUnavailableLine(trackKey: Any, modifier: Modifier = Modifier) 
 /** Stands in for [CurrentLyricLine] while a lookup is still in flight. */
 @Composable
 private fun LyricsLoadingLine(trackKey: Any, modifier: Modifier = Modifier) {
-    val text = remember(trackKey) { LYRICS_LOADING_LINES.random() }
+    val loadingLines = stringArrayResource(R.array.lyrics_loading_lines)
+    // Keep the loading copy stable while this track's lyric lookup is pending.
+    // The resource array itself is not a stable Compose key.
+    val text = remember(trackKey) { loadingLines.random() }
     Text(
         text = text,
         style = MaterialTheme.typography.titleMedium,
@@ -2775,6 +3100,99 @@ private fun LyricsLoadingLine(trackKey: Any, modifier: Modifier = Modifier) {
         overflow = TextOverflow.Ellipsis,
         modifier = modifier.padding(vertical = 4.dp),
     )
+}
+
+@OptIn(ExperimentalHazeMaterialsApi::class)
+@Composable
+private fun VideoAudioVersionButton(
+    audioVersion: Boolean,
+    loading: Boolean,
+    onClick: () -> Unit,
+    hazeState: HazeState,
+    modifier: Modifier = Modifier,
+) {
+    val haptics = rememberHaptics()
+    val shape = RoundedCornerShape(percent = 50)
+    Box(
+        modifier = modifier
+            .height(44.dp)
+            .clip(shape)
+            .optimizedHazeEffect(
+                state = hazeState,
+                // The opaque surface used by the nav bar is too dark over a
+                // player cover. A faint material tint keeps the same glass
+                // blur while letting the artwork's colour show through.
+                style = HazeMaterials.regular(MaterialTheme.colorScheme.surface.copy(alpha = 0.16f)),
+            )
+            .background(Color.White.copy(alpha = 0.04f)),
+        contentAlignment = Alignment.Center,
+    ) {
+        Row(
+            modifier = Modifier.padding(3.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            VideoAudioTab(
+                icon = Icons.Rounded.Videocam,
+                contentDescription = stringResource(R.string.revert_to_original),
+                selected = !audioVersion,
+                enabled = audioVersion && !loading,
+                onClick = {
+                    haptics.play(Haptic.Tap)
+                    onClick()
+                },
+            )
+            VideoAudioTab(
+                icon = BitChordIcons.MusicNote,
+                contentDescription = stringResource(R.string.convert_to_audio),
+                selected = audioVersion,
+                enabled = !audioVersion && !loading,
+                onClick = {
+                    haptics.play(Haptic.Tap)
+                    onClick()
+                },
+                loading = loading,
+            )
+        }
+    }
+}
+
+@Composable
+private fun VideoAudioTab(
+    icon: ImageVector,
+    contentDescription: String,
+    selected: Boolean,
+    enabled: Boolean,
+    onClick: () -> Unit,
+    loading: Boolean = false,
+) {
+    Box(
+        modifier = Modifier
+            .size(38.dp)
+            .clip(CircleShape)
+            .background(Color.White.copy(alpha = if (selected) 0.20f else 0f))
+            .clickable(
+                interactionSource = remember { MutableInteractionSource() },
+                indication = null,
+                enabled = enabled,
+                onClick = onClick,
+            ),
+        contentAlignment = Alignment.Center,
+    ) {
+        if (loading) {
+            CircularProgressIndicator(
+                modifier = Modifier.size(17.dp),
+                color = Color.White,
+                strokeWidth = 2.dp,
+            )
+        } else {
+            Icon(
+                imageVector = icon,
+                contentDescription = contentDescription,
+                tint = Color.White.copy(alpha = if (selected) 1f else 0.58f),
+                modifier = Modifier.size(19.dp),
+            )
+        }
+    }
 }
 
 /**
@@ -2812,12 +3230,18 @@ private fun CircleGlyph(
             },
         contentAlignment = Alignment.Center,
     ) {
-        Icon(
-            imageVector = icon,
-            contentDescription = contentDescription,
-            tint = Color.White,
-            modifier = Modifier.size(19.dp),
-        )
+        Crossfade(
+            targetState = icon,
+            animationSpec = tween(durationMillis = 180),
+            label = "playerMenuGlyph",
+        ) { glyph ->
+            Icon(
+                imageVector = glyph,
+                contentDescription = contentDescription,
+                tint = Color.White,
+                modifier = Modifier.size(19.dp),
+            )
+        }
     }
 }
 
@@ -3077,13 +3501,13 @@ private fun InlineQueue(
             verticalAlignment = Alignment.CenterVertically,
         ) {
             Text(
-                text = "Queue",
+                text = stringResource(R.string.queue),
                 style = MaterialTheme.typography.titleLarge,
                 color = Color.White,
                 modifier = Modifier.weight(1f),
             )
             Text(
-                text = "Clear",
+                text = stringResource(R.string.clear),
                 style = MaterialTheme.typography.titleMedium,
                 color = Color.White.copy(alpha = 0.75f),
                 modifier = Modifier
@@ -3129,8 +3553,11 @@ private fun InlineQueue(
                         .zIndex(if (dragging) 1f else 0f)
                         .graphicsLayer { translationY = if (dragging) manualDrag.renderOffset else 0f }
                         // The dragged row follows the finger, so it is the one
-                        // row that must not also be animating to a slot.
-                        .then(if (dragging) Modifier else Modifier.animateItem()),
+                        // row that must not also be animating to a slot. Its
+                        // neighbours skip the animation too, for as long as
+                        // *anything* in the section is being dragged — see the
+                        // note on [manualDrag] below for why.
+                        .then(if (manualDrag.draggedKey != null) Modifier else Modifier.animateItem()),
                 )
             }
             // Heading first, then what AutoPlay has lined up under it. With
@@ -3152,15 +3579,15 @@ private fun InlineQueue(
                         Spacer(Modifier.width(8.dp))
                         Column {
                             Text(
-                                text = "AutoPlay",
+                                text = stringResource(R.string.autoplay),
                                 style = MaterialTheme.typography.titleMedium,
                                 color = Color.White,
                             )
                             Text(
                                 text = if (autoplayStart < queue.size) {
-                                    "Similar music, picked to follow on"
+                                    stringResource(R.string.autoplay_queue_description)
                                 } else {
-                                    "Similar music will keep playing"
+                                    stringResource(R.string.autoplay_empty_description)
                                 },
                                 style = MaterialTheme.typography.bodyMedium,
                                 color = Color.White.copy(alpha = 0.55f),
@@ -3189,7 +3616,7 @@ private fun InlineQueue(
                     modifier = Modifier
                         .zIndex(if (dragging) 1f else 0f)
                         .graphicsLayer { translationY = if (dragging) autoplayDrag.renderOffset else 0f }
-                        .then(if (dragging) Modifier else Modifier.animateItem()),
+                        .then(if (autoplayDrag.draggedKey != null) Modifier else Modifier.animateItem()),
                 )
             }
         }
@@ -3625,7 +4052,7 @@ private fun InlineQueueRow(
         if (draggable) {
             Icon(
                 Icons.Rounded.DragHandle,
-                contentDescription = "Drag to reorder",
+                contentDescription = stringResource(R.string.drag_to_reorder),
                 tint = Color.White.copy(alpha = 0.4f),
                 modifier = Modifier
                     .size(20.dp)
@@ -3658,12 +4085,10 @@ private fun InlineQueueRow(
         )
         Spacer(Modifier.width(12.dp))
         Column(Modifier.weight(1f)) {
-            Text(
-                text = song.title,
+            ExplicitSongTitle(
+                song = song,
                 style = MaterialTheme.typography.titleMedium,
                 color = if (isCurrent) Color.White else Color.White.copy(alpha = 0.92f),
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
             )
             Text(
                 text = song.artist,
@@ -3676,7 +4101,7 @@ private fun InlineQueueRow(
         if (isCurrent) {
             Icon(
                 Icons.Rounded.GraphicEq,
-                contentDescription = "Now playing",
+                contentDescription = stringResource(R.string.now_playing),
                 tint = Color.White,
                 modifier = Modifier.size(18.dp),
             )
@@ -3691,7 +4116,7 @@ private fun InlineQueueRow(
         ) {
             Icon(
                 Icons.Rounded.Close,
-                contentDescription = "Remove from queue",
+                contentDescription = stringResource(R.string.remove_from_queue),
                 tint = Color.White.copy(alpha = 0.55f),
                 modifier = Modifier.size(18.dp),
             )
@@ -3703,7 +4128,7 @@ private fun formatTime(ms: Long): String {
     if (ms <= 0) return "0:00"
     val minutes = TimeUnit.MILLISECONDS.toMinutes(ms)
     val seconds = TimeUnit.MILLISECONDS.toSeconds(ms) % 60
-    return "%d:%02d".format(minutes, seconds)
+    return "%d:%02d".format(Locale.ROOT, minutes, seconds)
 }
 
 /**
@@ -3733,26 +4158,62 @@ private fun LosslessOrStats(
         // so the lookup runs — and can come back lossless — with that switch
         // off. Gating this on it left the badge blank through the wait and
         // then jumped straight to "Hi-Res Lossless".
-        (stillRacing || (isLoading && losslessRequested)) && nerdStats?.isLossless != true -> LosslessLabel(
-            text = "Upgrading Quality",
+        // The [isLoading] half is gated on `nerdStats == null` rather than
+        // `nerdStats?.isLossless != true`: `isLoading` is just
+        // `STATE_BUFFERING`, which a seek trips for a track whose quality
+        // question was already settled — swallowing back into cache still
+        // rebuffers. Gating on `!= true` read that rebuffer as "resolving"
+        // again and flashed "Upgrading Quality" over a track already known
+        // to be, say, Hi-Quality with no lossless copy anywhere. Once
+        // [nerdStats] exists there is something measured to show instead, so
+        // only a genuinely unmeasured track — or a real race via
+        // [stillRacing] — earns this label.
+        (stillRacing && nerdStats?.isLossless != true) ||
+            (isLoading && losslessRequested && nerdStats == null) -> LosslessLabel(
+            // What is already true, ahead of what is still being looked for.
+            // A race running over JioSaavn's 320kbps AAC and one running over
+            // YouTube's 160kbps Opus were both drawn as a bare "Upgrading
+            // Quality", which reads as "this is not good yet" — wrong on the
+            // first, where the track is already at the top of what lossy gets
+            // and the search is only chasing a lossless copy that may not
+            // exist. Naming the floor first makes the label describe a track
+            // rather than a wait.
+            //
+            // Decided on [NerdStats.Snapshot.isHiQuality] rather than on which
+            // source won, for the reason that property already gives: a
+            // 320kbps stream is a 320kbps stream wherever it came from. It
+            // reads the claimed rate when nothing is measured yet, so a
+            // JioSaavn stream qualifies from its first frame; YouTube's Opus
+            // sits under the threshold and keeps the plain label it had.
+            text = if (nerdStats?.isHiQuality == true) {
+                stringResource(R.string.high_quality_upgrading)
+            } else {
+                stringResource(R.string.upgrading_quality)
+            },
             animated = false,
             modifier = modifier,
         )
         nerdStats?.isLossless == true -> LosslessLabel(
             // Same line Tidal, Qobuz and Apple Music draw it at — see
             // [NerdStats.Snapshot.isHiRes].
-            text = if (nerdStats.isHiRes) "Hi-Res Lossless" else "Lossless",
+            text = stringResource(if (nerdStats.isHiRes) R.string.hi_res_lossless else R.string.lossless),
             // Shimmer is reserved for the thing that was asked for and
             // confirmed. It is what makes the badge read as an achievement
             // rather than a label, which only one of these two is.
             animated = true,
             modifier = modifier,
         )
+        nerdStats?.isDolbyAtmos == true -> LosslessLabel(
+            text = "Dolby Atmos",
+            animated = true,
+            iconPainter = painterResource(R.drawable.ic_dolby_atmos),
+            modifier = modifier,
+        )
         // Lossy, but the good end of lossy — a module's 320kbps tier, which
         // for a great many tracks is the best copy that exists anywhere the
         // app can reach. See [NerdStats.Snapshot.isHiQuality].
         nerdStats?.isHiQuality == true -> LosslessLabel(
-            text = "Hi-Quality",
+            text = stringResource(R.string.high_quality),
             animated = false,
             modifier = modifier,
         )
@@ -3760,20 +4221,36 @@ private fun LosslessOrStats(
     }
 }
 
-/** A headphone glyph ahead of the quality tag — "Upgrading Quality", "Hi-Quality", "Lossless". */
+/** A quality glyph ahead of the status label. */
 @Composable
-private fun LosslessLabel(text: String, animated: Boolean, modifier: Modifier = Modifier) {
+private fun LosslessLabel(
+    text: String,
+    animated: Boolean,
+    modifier: Modifier = Modifier,
+    icon: ImageVector = Icons.Rounded.Headphones,
+    iconPainter: Painter? = null,
+) {
     Row(
         modifier = modifier,
         horizontalArrangement = Arrangement.Center,
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        Icon(
-            imageVector = Icons.Rounded.Headphones,
-            contentDescription = null,
-            tint = Color.White.copy(alpha = if (animated) 0.7f else 0.45f),
-            modifier = Modifier.size(13.dp),
-        )
+        val tint = Color.White.copy(alpha = if (animated) 0.7f else 0.45f)
+        if (iconPainter != null) {
+            Icon(
+                painter = iconPainter,
+                contentDescription = null,
+                tint = tint,
+                modifier = Modifier.size(width = 13.dp, height = 10.dp),
+            )
+        } else {
+            Icon(
+                imageVector = icon,
+                contentDescription = null,
+                tint = tint,
+                modifier = Modifier.size(13.dp),
+            )
+        }
         Spacer(Modifier.width(4.dp))
         if (animated) {
             ShimmerText(text = text)
@@ -3850,22 +4327,22 @@ private fun ShimmerText(text: String) {
  * A stream that arrived worse than its source promised gets that stated
  * outright rather than left to be spotted — see [NerdStats.Snapshot.downgraded].
  */
-private fun NerdStats.Snapshot.describe(): String? {
+private fun NerdStats.Snapshot.describe(context: android.content.Context): String? {
     val parts = buildList {
         codecLabel(mimeType)?.let(::add)
-        bitDepth?.let { add("$it-bit") }
+        bitDepth?.let { add(context.getString(R.string.bit_depth, it)) }
         if (!isLossless) bitrateKbps?.let { add("$it kbps") }
-        sampleRateHz?.let { add("%.1f kHz".format(it / 1000f)) }
+        sampleRateHz?.let { add("%.1f kHz".format(Locale.ROOT, it / 1000f)) }
         channels?.let {
             add(
                 when (it) {
-                    1 -> "Mono"
-                    2 -> "Stereo"
-                    else -> "$it ch"
+                    1 -> context.getString(R.string.mono)
+                    2 -> context.getString(R.string.stereo)
+                    else -> context.getString(R.string.channel_count, it)
                 },
             )
         }
-        if (downgraded) add("↓ from ${claimed?.summary}")
+        if (downgraded) add(context.getString(R.string.downgraded_from, claimed?.summary.orEmpty()))
     }
     return parts.joinToString(" · ").takeIf { it.isNotEmpty() }
 }
@@ -3879,16 +4356,17 @@ private fun codecLabel(mimeType: String?): String? = when {
     mimeType.endsWith("mpeg") -> "MP3"
     mimeType.endsWith("flac") -> "FLAC"
     mimeType.endsWith("alac") -> "ALAC"
-    else -> mimeType.substringAfter('/').uppercase()
+    else -> mimeType.substringAfter('/').uppercase(Locale.ROOT)
 }
 
 /** Wording for the stats line; see [TrackAnalysisState]. */
-private fun TrackAnalysisState.label(): String = when (this) {
-    TrackAnalysisState.ANALYSED -> "analysed"
-    TrackAnalysisState.REFINING -> "analysed, refining…"
-    TrackAnalysisState.ANALYSING -> "analysing…"
-    TrackAnalysisState.WAITING -> "waiting"
-    TrackAnalysisState.FAILED -> "failed"
+@Composable
+private fun TrackAnalysisState.localizedLabel(): String = when (this) {
+    TrackAnalysisState.ANALYSED -> stringResource(R.string.analysis_complete)
+    TrackAnalysisState.REFINING -> stringResource(R.string.analysis_refining)
+    TrackAnalysisState.ANALYSING -> stringResource(R.string.analysis_in_progress)
+    TrackAnalysisState.WAITING -> stringResource(R.string.waiting)
+    TrackAnalysisState.FAILED -> stringResource(R.string.failed)
 }
 
 /**

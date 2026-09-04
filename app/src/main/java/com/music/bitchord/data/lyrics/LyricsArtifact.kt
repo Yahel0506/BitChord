@@ -83,6 +83,3 @@ object LyricsSerializer {
         return "$minutes:$seconds.$centiseconds"
     }
 }
-
-/** Standard LRC representation for extension callers. */
-internal fun List<LyricLine>.toLrc(): String = LyricsSerializer.toLrc(this, wordSynced = false)
