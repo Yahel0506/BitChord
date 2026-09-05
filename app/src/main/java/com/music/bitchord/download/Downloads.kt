@@ -84,7 +84,6 @@ object Downloads {
     private const val KEY_SAVED_METADATA = "downloaded_tracks_metadata"
     private const val KEY_SAVED_COLLECTIONS = "downloaded_collections"
 
-    private const val LOSSLESS_LOOKUP_MS = 20_000L
     private const val LYRICS_LOOKUP_MS = 15_000L
 
     private lateinit var prefs: SharedPreferences
@@ -785,26 +784,40 @@ object Downloads {
                     return@coroutineScope
                 }
 
-                if (route.offlineHls != null) {
-                    val savedUri = OfflineHls.save(
-                        context = context,
-                        id = id,
-                        url = route.offlineHls.url,
-                        headers = route.offlineHls.headers,
-                        onProgress = { written, total ->
-                            val fraction = written.toFloat() / total
-                            _active.update { it + (id to DownloadState.Running(fraction)) }
-                            DownloadSession.running(id, fraction)
-                        },
-                        lyrics = lyrics?.await(),
-                        artwork = artwork?.await(),
-                    )
+                val manifest = route.offlineHls
+                if (manifest != null) {
+                    val onSegment: (Long, Long) -> Unit = { written, total ->
+                        val fraction = written.toFloat() / total
+                        _active.update { it + (id to DownloadState.Running(fraction)) }
+                        DownloadSession.running(id, fraction)
+                    }
+                    val savedUri = if (manifest.dash) {
+                        OfflineDash.save(
+                            context = context,
+                            id = id,
+                            url = manifest.url,
+                            headers = manifest.headers,
+                            onProgress = onSegment,
+                            lyrics = lyrics?.await(),
+                            artwork = artwork?.await(),
+                        )
+                    } else {
+                        OfflineHls.save(
+                            context = context,
+                            id = id,
+                            url = manifest.url,
+                            headers = manifest.headers,
+                            onProgress = onSegment,
+                            lyrics = lyrics?.await(),
+                            artwork = artwork?.await(),
+                        )
+                    }
                     val artifact = lyricsArtifact?.await()
                     val lyricsResult = saveLyricsSidecar(context, name, artifact)
                     remember(song, track, savedUri, route.downloadFormat, lyricsResult)
                     DownloadSession.done(id)
                     clear(id)
-                    Log.d(TAG, "saved offline HLS package for $name")
+                    Log.d(TAG, "saved offline ${if (manifest.dash) "DASH" else "HLS"} package for $name")
                     return@coroutineScope
                 }
 
@@ -1118,7 +1131,6 @@ object Downloads {
 
     private fun clear(videoId: String) {
         _active.update { it - videoId }
-        DownloadSession.clear(videoId)
     }
 
     private fun fail(videoId: String, reason: String) {
@@ -1180,7 +1192,7 @@ object Downloads {
      * separate them. Guessing wrong there would answer a request for lossless
      * with a transcode and never fetch the real thing.
      */
-    private val LOSSLESS_EXTENSIONS = listOf("flac", "alac", "dsd")
+    private val LOSSLESS_EXTENSIONS = listOf("flac", "wav")
 
     /**
      * Why a download didn't start, when the reason is a setting rather than a
@@ -1190,7 +1202,7 @@ object Downloads {
      * looking for a network problem that isn't there. Shared with the callers
      * that show it as a toast so the two cannot drift apart.
      */
-    private const val WIFI_ONLY_REFUSAL = "Downloads are only allowed over WiFi"
+    internal const val WIFI_ONLY_REFUSAL = "Downloads are set to Wi-Fi only"
 
     /** Dropped when the sheet is reopened; a failure is worth showing once. */
     fun dismissFailure(videoId: String) {
