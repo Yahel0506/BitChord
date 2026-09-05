@@ -802,38 +802,9 @@ object Downloads {
                     val artifact = lyricsArtifact?.await()
                     val lyricsResult = saveLyricsSidecar(context, name, artifact)
                     remember(song, track, savedUri, route.downloadFormat, lyricsResult)
-                val manifest = route.offlineHls
-                if (manifest != null) {
-                    val onSegment: (Long, Long) -> Unit = { written, total ->
-                        val fraction = written.toFloat() / total
-                        _active.update { it + (id to DownloadState.Running(fraction)) }
-                        DownloadSession.running(id, fraction)
-                    }
-                    val savedUri = if (manifest.dash) {
-                        OfflineDash.save(
-                            context = context,
-                            id = id,
-                            url = manifest.url,
-                            headers = manifest.headers,
-                            onProgress = onSegment,
-                            lyrics = lyrics?.await(),
-                            artwork = artwork?.await(),
-                        )
-                    } else {
-                        OfflineHls.save(
-                            context = context,
-                            id = id,
-                            url = manifest.url,
-                            headers = manifest.headers,
-                            onProgress = onSegment,
-                            lyrics = lyrics?.await(),
-                            artwork = artwork?.await(),
-                        )
-                    }
-                    remember(song, track, savedUri, route.downloadFormat)
                     DownloadSession.done(id)
                     clear(id)
-                    Log.d(TAG, "saved offline ${if (manifest.dash) "DASH" else "HLS"} package for $name")
+                    Log.d(TAG, "saved offline HLS package for $name")
                     return@coroutineScope
                 }
 
@@ -1147,6 +1118,7 @@ object Downloads {
 
     private fun clear(videoId: String) {
         _active.update { it - videoId }
+        DownloadSession.clear(videoId)
     }
 
     private fun fail(videoId: String, reason: String) {
@@ -1208,7 +1180,7 @@ object Downloads {
      * separate them. Guessing wrong there would answer a request for lossless
      * with a transcode and never fetch the real thing.
      */
-    private val LOSSLESS_EXTENSIONS = listOf("flac", "wav")
+    private val LOSSLESS_EXTENSIONS = listOf("flac", "alac", "dsd")
 
     /**
      * Why a download didn't start, when the reason is a setting rather than a
@@ -1218,7 +1190,7 @@ object Downloads {
      * looking for a network problem that isn't there. Shared with the callers
      * that show it as a toast so the two cannot drift apart.
      */
-    internal const val WIFI_ONLY_REFUSAL = "Downloads are set to Wi-Fi only"
+    private const val WIFI_ONLY_REFUSAL = "Downloads are only allowed over WiFi"
 
     /** Dropped when the sheet is reopened; a failure is worth showing once. */
     fun dismissFailure(videoId: String) {
