@@ -24,12 +24,8 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.ArrowBack
 import androidx.compose.material.icons.rounded.Close
-import androidx.compose.material.icons.rounded.Delete
-import androidx.compose.material.icons.rounded.DeleteForever
-import androidx.compose.material.icons.rounded.Edit
 import androidx.compose.material.icons.rounded.Link
 import androidx.compose.material.icons.rounded.Lock
-import androidx.compose.material.icons.rounded.PlayArrow
 import androidx.compose.material.icons.rounded.Public
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
@@ -46,6 +42,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
@@ -56,6 +53,7 @@ import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import coil3.compose.AsyncImage
+import com.music.bitchord.R
 import com.music.bitchord.data.model.PlaylistPrivacy
 import com.music.bitchord.data.model.ROW_ART_PX
 import com.music.bitchord.data.model.Song
@@ -63,6 +61,7 @@ import com.music.bitchord.data.model.UserPlaylist
 import com.music.bitchord.data.model.artworkAt
 import com.music.bitchord.ui.components.thumbnailBorder
 import com.music.bitchord.ui.icons.BitChordIcons
+import java.util.Locale
 
 /**
  * Where a track goes: one of the account's playlists, or a new one.
@@ -105,11 +104,14 @@ fun PlaylistPickerSheet(
             SheetTrackHeader(song)
             HorizontalDivider(thickness = 0.5.dp, color = MaterialTheme.colorScheme.outline)
         }
-        SheetHeading(if (song != null) "ADD TO PLAYLIST" else "YOUR PLAYLISTS")
+        SheetHeading(
+            stringResource(if (song != null) R.string.add_to_playlist else R.string.your_playlists)
+                .uppercase(Locale.getDefault()),
+        )
 
         ActionRow(
             icon = BitChordIcons.Plus,
-            label = "New playlist",
+            label = stringResource(R.string.new_playlist),
             onClick = { creating = true },
         )
 
@@ -129,7 +131,7 @@ fun PlaylistPickerSheet(
             }
 
             playlists.isEmpty() -> Text(
-                text = "No playlists yet — the row above makes one.",
+                text = stringResource(R.string.no_playlists_yet),
                 style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 modifier = Modifier.padding(horizontal = 22.dp, vertical = 18.dp),
@@ -237,19 +239,19 @@ private fun NewPlaylistForm(
                 IconButton(onClick = it) {
                     Icon(
                         Icons.AutoMirrored.Rounded.ArrowBack,
-                        contentDescription = "Back",
+                        contentDescription = stringResource(R.string.back),
                         tint = MaterialTheme.colorScheme.onBackground,
                     )
                 }
             }
             Column(Modifier.weight(1f)) {
                 Text(
-                    text = "New playlist",
+                    text = stringResource(R.string.new_playlist),
                     style = MaterialTheme.typography.titleLarge,
                     color = MaterialTheme.colorScheme.onBackground,
                 )
                 Text(
-                    text = "Saved to your YouTube Music account",
+                    text = stringResource(R.string.saved_to_youtube_music_account),
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
@@ -268,7 +270,7 @@ private fun NewPlaylistForm(
             Box(Modifier.weight(1f)) {
                 if (name.isEmpty()) {
                     Text(
-                        text = "Playlist name",
+                        text = stringResource(R.string.playlist_name),
                         style = MaterialTheme.typography.bodyLarge,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
@@ -298,7 +300,7 @@ private fun NewPlaylistForm(
                 ) {
                     Icon(
                         Icons.Rounded.Close,
-                        contentDescription = "Clear name",
+                        contentDescription = stringResource(R.string.clear_name),
                         tint = MaterialTheme.colorScheme.onSurfaceVariant,
                         modifier = Modifier.size(18.dp),
                     )
@@ -306,7 +308,7 @@ private fun NewPlaylistForm(
             }
         }
 
-        SheetHeading("WHO CAN SEE IT")
+        SheetHeading(stringResource(R.string.who_can_see_it).uppercase(Locale.getDefault()))
         Row(
             modifier = Modifier
                 .fillMaxWidth()
@@ -331,95 +333,19 @@ private fun NewPlaylistForm(
                 .fillMaxWidth()
                 .padding(horizontal = 22.dp),
         ) {
-            Text("Create playlist")
+            Text(stringResource(R.string.create_playlist))
         }
         Spacer(Modifier.height(28.dp))
     }
 }
 
 /**
- * Long-press menu for one of the account's own playlists, on the Library tab —
- * the other half of being able to create them.
- *
- * Deleting asks a second time, in place. A playlist is the only thing in this
- * app whose loss can't be undone by tapping the same row again, and a
- * mis-tapped row in a shelf is exactly how it would happen.
+ * The rename panel of [BrowseActionsSheet], which swaps itself out for this
+ * rather than opening a dialog over itself — same reason the create form lives
+ * inside [PlaylistPickerSheet].
  */
 @Composable
-fun PlaylistActionsSheet(
-    playlist: UserPlaylist,
-    onOpen: () -> Unit,
-    onRename: (String) -> Unit,
-    onDelete: () -> Unit,
-    modifier: Modifier = Modifier,
-) {
-    var renaming by remember { mutableStateOf(false) }
-    var confirmingDelete by remember { mutableStateOf(false) }
-
-    if (renaming) {
-        RenamePlaylistForm(
-            playlist = playlist,
-            onBack = { renaming = false },
-            onRename = onRename,
-            modifier = modifier,
-        )
-        return
-    }
-
-    Column(modifier.fillMaxWidth()) {
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(horizontal = 20.dp, vertical = 10.dp),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            AsyncImage(
-                model = playlist.thumbnailUrl.artworkAt(ROW_ART_PX),
-                contentDescription = null,
-                modifier = Modifier
-                    .size(52.dp)
-                    .clip(RoundedCornerShape(8.dp))
-                    .thumbnailBorder(RoundedCornerShape(8.dp))
-                    .background(MaterialTheme.colorScheme.surfaceVariant),
-            )
-            Spacer(Modifier.width(14.dp))
-            Column(Modifier.weight(1f)) {
-                Text(
-                    text = playlist.title,
-                    style = MaterialTheme.typography.titleMedium,
-                    color = MaterialTheme.colorScheme.onBackground,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                )
-                Text(
-                    text = playlist.subtitle.ifBlank { "Playlist" },
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                )
-            }
-        }
-        HorizontalDivider(thickness = 0.5.dp, color = MaterialTheme.colorScheme.outline)
-
-        ActionRow(Icons.Rounded.PlayArrow, "Open playlist", onClick = onOpen)
-        ActionRow(Icons.Rounded.Edit, "Rename") { renaming = true }
-        if (confirmingDelete) {
-            ActionRow(
-                icon = Icons.Rounded.DeleteForever,
-                label = "Delete \"${playlist.title}\" — tap to confirm",
-                tint = MaterialTheme.colorScheme.error,
-                onClick = onDelete,
-            )
-        } else {
-            ActionRow(Icons.Rounded.Delete, "Delete playlist") { confirmingDelete = true }
-        }
-        Spacer(Modifier.height(24.dp))
-    }
-}
-
-@Composable
-private fun RenamePlaylistForm(
+internal fun RenamePlaylistForm(
     playlist: UserPlaylist,
     onBack: () -> Unit,
     onRename: (String) -> Unit,
@@ -454,12 +380,12 @@ private fun RenamePlaylistForm(
             IconButton(onClick = onBack) {
                 Icon(
                     Icons.AutoMirrored.Rounded.ArrowBack,
-                    contentDescription = "Back",
+                    contentDescription = stringResource(R.string.back),
                     tint = MaterialTheme.colorScheme.onBackground,
                 )
             }
             Text(
-                text = "Rename playlist",
+                text = stringResource(R.string.rename_playlist),
                 style = MaterialTheme.typography.titleLarge,
                 color = MaterialTheme.colorScheme.onBackground,
                 modifier = Modifier.weight(1f),
@@ -497,7 +423,7 @@ private fun RenamePlaylistForm(
                 .fillMaxWidth()
                 .padding(horizontal = 22.dp),
         ) {
-            Text("Save name")
+            Text(stringResource(R.string.save_name))
         }
         Spacer(Modifier.height(28.dp))
     }

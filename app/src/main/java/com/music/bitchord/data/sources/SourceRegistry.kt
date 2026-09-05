@@ -6,6 +6,8 @@ import android.net.Uri
 import android.util.Log
 import com.music.bitchord.BuildConfig
 import com.music.bitchord.data.TrackLog
+import com.music.bitchord.data.settings.AppSettings
+import com.music.bitchord.data.settings.AudioQuality
 import androidx.security.crypto.EncryptedSharedPreferences
 import androidx.security.crypto.MasterKey
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -104,12 +106,26 @@ object SourceRegistry {
         // URL if it changed. The toggle’s enabled state is always preserved so
         // the user’s on/off choice survives an app update.
         val envUrl = BuildConfig.MODULE_INDEX_URL.trim()
-        val after = if (envUrl.isNotEmpty()) {
+        val withModule = if (envUrl.isNotEmpty()) {
             val existingModule = seeded.firstOrNull { it.kind == SourceKind.MODULE }
             if (existingModule == null) {
-                seeded + SourceConfig(kind = SourceKind.MODULE, baseUrl = envUrl, enabled = true)
-            } else if (existingModule.baseUrl != envUrl) {
-                seeded.map { if (it.kind == SourceKind.MODULE) it.copy(baseUrl = envUrl) else it }
+                seeded + SourceConfig(
+                    kind = SourceKind.MODULE,
+                    label = ENV_MODULE_LABEL,
+                    baseUrl = envUrl,
+                    enabled = true,
+                )
+            } else if (existingModule.baseUrl != envUrl || existingModule.label.isBlank()) {
+                // The label is filled in as well as the URL, so the env-managed
+                // module is named rather than showing the bare index host —
+                // which is what [SourceConfig.displayName] falls back to.
+                seeded.map {
+                    if (it.kind == SourceKind.MODULE) {
+                        it.copy(baseUrl = envUrl, label = it.label.ifBlank { ENV_MODULE_LABEL })
+                    } else {
+                        it
+                    }
+                }
             } else {
                 seeded
             }
@@ -118,6 +134,13 @@ object SourceRegistry {
             // is no leftover env-managed module config lying around from a
             // previous build that did have one.
             seeded
+        }
+
+        // YouTube is not switchable — see [setEnabled] — so a config persisted
+        // as disabled by an earlier build would strand the app with no source
+        // it is allowed to turn back on.
+        val after = withModule.map {
+            if (it.kind == SourceKind.YOUTUBE && !it.enabled) it.copy(enabled = true) else it
         }
 
         publish(after, persist = after != stored)
@@ -141,12 +164,35 @@ object SourceRegistry {
         }
     }
 
-    /** The enabled sources, module first and YouTube last, however they're stored. */
+    /**
+     * The enabled sources, module first and YouTube last, however they're stored.
+     *
+     * The user's standing choice and nothing else. A stream is budgeted on top
+     * of this by [activeForPlayback]; a download is not budgeted here at all —
+     * see [SourceResolver.forDownload].
+     */
     fun active(): List<MusicSource> =
         configs.value
             .filter { it.enabled && it.isComplete }
             .sortedBy { it.kind.ordinal }
             .mapNotNull { instances[it.id] }
+
+    /**
+     * [active], minus the sources the ceiling on the connection in hand does
+     * not pay for — see [AudioQuality.permits].
+     *
+     * Every path that starts or plans a *stream* asks this rather than
+     * [active], so the Wi-Fi and mobile-data rungs stay two independent
+     * answers to "what does this minute cost" and switching networks switches
+     * between them. Downloads deliberately keep asking [active]: what a saved
+     * file is worth is [DownloadQuality][com.music.bitchord.data.settings.DownloadQuality]'s
+     * question, and when it may be fetched is
+     * [AppSettings.wifiOnlyDownloads][com.music.bitchord.data.settings.AppSettings.wifiOnlyDownloads]'s.
+     */
+    fun activeForPlayback(): List<MusicSource> {
+        val ceiling = AppSettings.effectiveAudioQuality
+        return active().filter { ceiling.permits(it.kind) }
+    }
 
     fun instance(configId: String): MusicSource? = instances[configId]
 
@@ -165,13 +211,53 @@ object SourceRegistry {
         publish(configs.value.filterNot { it.id == configId })
     }
 
-    fun setEnabled(configId: String, enabled: Boolean) =
+    /**
+     * Turns one source on or off.
+     *
+     * YouTube is not switchable and silently ignores a request to disable it.
+     * It is the only source that can supply a home feed, radio or related
+     * tracks, and nothing else holds the full catalogue — switching it off
+     * doesn't even stop it being played, because a YouTube-queued track whose
+     * substitutes all miss still falls back to it. A switch that cannot honour
+     * its own off position is worse than no switch, so it isn't offered one:
+     * see [SourcesScreen][com.music.bitchord.ui.screens.SourcesScreen].
+     */
+    fun setEnabled(configId: String, enabled: Boolean) {
+        if (!enabled && config(configId)?.kind == SourceKind.YOUTUBE) return
         publish(configs.value.map { if (it.id == configId) it.copy(enabled = enabled) else it })
+    }
 
-    /** Toggle the MODULE source on or off by its config id. */
-    fun setModuleEnabled(enabled: Boolean) {
-        val module = configs.value.firstOrNull { it.kind == SourceKind.MODULE } ?: return
-        setEnabled(module.id, enabled)
+    /** The user's own module index, if they have set one. */
+    fun customModule(): SourceConfig? =
+        configs.value.firstOrNull { it.kind == SourceKind.CUSTOM_MODULE }
+
+    /**
+     * Points the custom module at [url], replacing whatever was there.
+     *
+     * Only ever one: a second index would be a second full search on every
+     * track for a feature whose whole purpose is "use mine instead", and the
+     * order between two of them would be arbitrary. So this replaces rather
+     * than appends, and a blank [url] clears it.
+     *
+     * The replacement is a *new* [SourceConfig] rather than an edit of the old
+     * one, so [publish] sees a different id and drops the warm [ModuleSource]
+     * built against the previous index — see [configuredBy].
+     */
+    fun setCustomModule(url: String, label: String = "") {
+        val trimmed = url.trim()
+        val without = configs.value.filterNot { it.kind == SourceKind.CUSTOM_MODULE }
+        if (trimmed.isEmpty()) {
+            publish(without)
+            return
+        }
+        publish(
+            without + SourceConfig(
+                kind = SourceKind.CUSTOM_MODULE,
+                label = label.trim(),
+                baseUrl = trimmed,
+                enabled = true,
+            ),
+        )
     }
 
     private fun publish(next: List<SourceConfig>, persist: Boolean = true) {
@@ -203,7 +289,10 @@ object SourceRegistry {
     suspend fun probeCandidate(config: SourceConfig): SourceHealth = build(config).health()
 
     private fun build(config: SourceConfig): MusicSource = when (config.kind) {
+        // Same protocol, same implementation — the kinds differ only in rank.
+        SourceKind.CUSTOM_MODULE -> ModuleSource(config)
         SourceKind.MODULE -> ModuleSource(config)
+        SourceKind.JIOSAAVN -> JioSaavnSource(config)
         SourceKind.YOUTUBE -> YouTubeSource(config)
     }
 
@@ -253,7 +342,10 @@ object SourceRegistry {
             .build()
             .toString()
 
-    private val BUILT_IN_KINDS = listOf(SourceKind.YOUTUBE)
+    private val BUILT_IN_KINDS = listOf(SourceKind.JIOSAAVN, SourceKind.YOUTUBE)
+
+    /** What the build-time module index is called on screen, in place of its host. */
+    private const val ENV_MODULE_LABEL = "Ricky's Addon"
 
     private const val KEY_SOURCES = "sources"
     private const val PREFIX = "src:"

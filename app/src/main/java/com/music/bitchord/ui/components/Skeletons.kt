@@ -7,6 +7,7 @@ import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
@@ -154,19 +155,27 @@ fun LazyListScope.songListSkeleton(
 private fun HeroShelfSkeleton() {
     Column(Modifier.padding(bottom = 26.dp)) {
         SectionHeaderSkeleton()
-        LazyRow(
-            contentPadding = PaddingValues(horizontal = PAGE_GUTTER),
-            horizontalArrangement = Arrangement.spacedBy(14.dp),
-            userScrollEnabled = false,
-        ) {
-            items(2) {
-                ShimmerBox(
-                    modifier = Modifier.fillParentMaxWidth(0.82f).aspectRatio(0.92f),
-                    shape = RoundedCornerShape(18.dp),
-                )
+        BoxWithConstraints {
+            val cardWidth = heroCardWidth(maxWidth)
+            LazyRow(
+                contentPadding = PaddingValues(horizontal = PAGE_GUTTER),
+                horizontalArrangement = Arrangement.spacedBy(14.dp),
+                userScrollEnabled = false,
+            ) {
+                items(2) {
+                    ShimmerBox(
+                        modifier = Modifier.width(cardWidth).aspectRatio(HERO_CARD_RATIO),
+                        shape = RoundedCornerShape(18.dp),
+                    )
+                }
             }
         }
     }
+}
+
+/** Reserved at the very top of Play while the independent Recently played request is in flight. */
+fun LazyListScope.recentlyPlayedSkeleton() {
+    item(key = "skeleton:recently-played") { HeroShelfSkeleton() }
 }
 
 /** The compact carousel of square cards used by every shelf below the first. */

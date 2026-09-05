@@ -3,6 +3,7 @@ package com.music.bitchord.data.sources
 import android.util.Log
 import com.music.bitchord.data.TrackLog
 import com.music.bitchord.data.model.Song
+import com.music.bitchord.data.settings.AppSettings
 import com.music.bitchord.data.sources.module.ModuleManager
 import com.music.bitchord.data.sources.module.ModuleSearchResult
 import com.music.bitchord.data.sources.module.SpineModule
@@ -14,9 +15,10 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
+import java.util.Locale
 
 /**
- * A [MusicSource] backed by one or more Convx-compatible JS module plugins.
+ * A [MusicSource] backed by one or more compatible JS module plugins.
  *
  * The [config]'s [SourceConfig.baseUrl] points at a module-index JSON
  * (e.g. `https://example.com/index.json`). That index lists `SpineModule`
@@ -122,7 +124,18 @@ class ModuleSource(
                 // holding the best copy, and the grace period is what buys the
                 // chance to compare them.
                 if (waitForAll) {
-                    withTimeoutOrNull(SEARCH_PATIENT_MS) { jobs.joinAll() }
+                    // Patient, not indefinite. A flat join on everyone made the
+                    // *slowest* module the price of every single track — and on
+                    // a batch download, where this path runs once per track back
+                    // to back, a module that simply never answers was 20s of
+                    // dead time per song and nothing to show for it. Every
+                    // module still gets a real hearing, several times what the
+                    // live path allows; what it no longer gets is unlimited
+                    // time while the queue stands still.
+                    withTimeoutOrNull(SEARCH_PATIENT_MS) {
+                        withTimeoutOrNull(SEARCH_BUDGET_MS) { first.await() }
+                        withTimeoutOrNull(SEARCH_PATIENT_GRACE_MS) { jobs.joinAll() }
+                    }
                 } else {
                     withTimeoutOrNull(SEARCH_BUDGET_MS) { first.await() }
                     withTimeoutOrNull(SEARCH_GRACE_MS) { jobs.joinAll() }
@@ -157,7 +170,7 @@ class ModuleSource(
                 albumName = track.album.ifBlank { null },
                 thumbnailUrl = track.albumCover,
                 durationText = track.duration.takeIf { it > 0 }
-                    ?.let { "${it / 60}:${"%02d".format(it % 60)}" },
+                    ?.let { "${it / 60}:${"%02d".format(Locale.ROOT, it % 60)}" },
                 sourceQuality = rowTier(track),
             )
         }
@@ -230,7 +243,7 @@ class ModuleSource(
                 TrackLog.w(TAG, "${config.displayName}: getStreamUrl failed for $upstreamId — ${e.message}")
                 return@withContext null
             }
-            val url = streamResponse.streamUrl.ifBlank { null } ?: run {
+            val url = streamResponse.streamUrl?.ifBlank { null } ?: run {
                 TrackLog.w(TAG, "${config.displayName}: empty stream URL for $upstreamId")
                 return@withContext null
             }
@@ -244,15 +257,29 @@ class ModuleSource(
             }
 
             val trackMeta = streamResponse.track
-            SourceStream(
-                url = url,
-                format = StreamFormat(
-                    codec = codecOf(trackMeta?.mimeType, trackMeta?.audioQuality, url),
-                    kbps = kbpsFor(trackMeta?.audioQuality, url),
-                    sampleRateHz = trackMeta?.sampleRate?.toInt()?.takeIf { it > 0 },
-                    bitDepth = trackMeta?.bitDepth?.takeIf { it > 0 },
-                ),
+            val format = StreamFormat(
+                codec = codecOf(trackMeta?.mimeType, trackMeta?.audioQuality, url),
+                kbps = trackMeta?.bitrate ?: kbpsFor(trackMeta?.audioQuality, url),
+                sampleRateHz = trackMeta?.sampleRate?.let {
+                    if (it < 1000) (it * 1000).toInt() else it.toInt()
+                }?.takeIf { it > 0 },
+                bitDepth = trackMeta?.bitDepth?.takeIf { it > 0 },
             )
+            val playsAtmos = DeviceCodecs.playsDolbyAtmos
+            if (unplayable(format, atmosAllowed = playsAtmos && AppSettings.dolbyAtmos.value)) {
+                val why = if (playsAtmos) {
+                    "which is switched off in Settings"
+                } else {
+                    "which this device has no decoder for"
+                }
+                TrackLog.w(
+                    TAG,
+                    "${config.displayName}: $moduleId answered a ${request.tier} request with " +
+                        "${format.summary}, $why — passing",
+                )
+                return@withContext null
+            }
+            SourceStream(url = url, format = format)
         }
 
     /**
@@ -270,11 +297,16 @@ class ModuleSource(
      * guessed at — [kbpsFor] carries what is known about those instead.
      */
     private fun codecOf(mimeType: String?, quality: String?, url: String): String? {
-        mimeType?.substringAfterLast('/')?.substringBefore(';')?.trim()?.lowercase()
+        mimeType?.substringAfterLast('/')?.substringBefore(';')?.trim()?.lowercase(Locale.ROOT)
             ?.takeIf { it.isNotEmpty() }
             ?.let { return it }
+        val qualityText = quality.orEmpty().uppercase(Locale.ROOT)
+        // Tidal's MAX endpoint identifies its Dolby Atmos HLS rendition as
+        // EAC3_JOC. Older module responses expose only "Dolby Atmos", so
+        // preserve its real codec instead of reducing the stream to unknown.
+        if ("ATMOS" in qualityText || "EAC3_JOC" in qualityText || "EC-3" in qualityText) return "eac3-joc"
         if (qualityTier(quality.orEmpty()) == LOSSLESS) return "flac"
-        return url.substringBefore('?').substringAfterLast('.').lowercase()
+        return url.substringBefore('?').substringAfterLast('.').lowercase(Locale.ROOT)
             .takeIf { it in AUDIO_EXTENSIONS }
     }
 
@@ -316,6 +348,20 @@ class ModuleSource(
     private fun settingsFor(request: StreamRequest): Map<String, String> = mapOf(
         "quality" to request.tier,
         "fallbackMode" to if (request is StreamRequest.Lossless) "strict" else "flexible",
+        // Whether an immersive rendition is wanted at all, which the tier
+        // above cannot express: `LOSSLESS` is a statement about bit-exactness
+        // and Atmos is not bit-exact, so a module reading only the tier has to
+        // guess which of the two the listener meant. Both answers are wrong
+        // somewhere — guess Atmos and a lossless request comes back lossy;
+        // guess FLAC and a device that can render the spatial mix never gets
+        // offered it. This says it outright.
+        //
+        // Repeats what [unplayable] enforces on the way back rather than
+        // replacing it. A module is somebody else's JavaScript and is free to
+        // ignore anything it is handed — the Tidal one ignores the tier and
+        // asks its backend for `MAX` regardless — so this is the polite ask
+        // and the check on the response is the guarantee.
+        "dolbyAtmos" to (DeviceCodecs.playsDolbyAtmos && AppSettings.dolbyAtmos.value).toString(),
     )
 
     private val StreamRequest.tier: String
@@ -418,7 +464,40 @@ class ModuleSource(
         }
 
         /**
-         * The three tiers every Convx-compatible module speaks, whatever it
+         * Whether the rendition a module has just handed over is one that must
+         * not be played.
+         *
+         * Only Dolby Atmos, and only because it is the one tier a module can
+         * serve that a phone can be flatly unable to decode — see
+         * [DeviceCodecs] for why the player is the wrong place to find that
+         * out. Every other codec a module returns is either in Android's own
+         * set or fails loudly enough for the recovery path to hear it.
+         *
+         * [atmosAllowed] is the two answers folded into one, because from here
+         * they mean the same thing and neither is more binding than the other:
+         * the device has no decoder
+         * ([DeviceCodecs.playsDolbyAtmos]) or the listener turned it off
+         * ([AppSettings.dolbyAtmos]). The caller keeps them apart only to say
+         * which it was in the log.
+         *
+         * Caught *here*, where the module answers, rather than by ranking it
+         * lower in [SourceResolver]: an Atmos rendition is routinely the only
+         * one a module will give for a track, so there is no lower-ranked
+         * sibling of it to fall to and a ranking has nothing to choose between.
+         * The Tidal module traced in September 2026 is exactly that shape — it
+         * ignores the tier it is passed and always asks its backend for `MAX`,
+         * so a track with an Atmos master answers a `LOSSLESS` request with
+         * Atmos, over a FLAC of the same recording the same backend serves
+         * happily when asked for one. Refusing is what lets [SourceResolver]
+         * move to a source that can be heard. Nothing on this side can reach
+         * past the module to the copy it declined to offer, so on a device with
+         * no Dolby decoder that track is YouTube's until the module is fixed.
+         */
+        internal fun unplayable(format: StreamFormat, atmosAllowed: Boolean): Boolean =
+            format.isDolbyAtmos && !atmosAllowed
+
+        /**
+         * The three tiers every compatible module speaks, whatever it
          * calls them on the way out: `LOSSLESS`, `FLAC 16-bit / 44.1kHz` and
          * `hires-96` are one tier; `320kbps` and `HIGH` are another.
          */
@@ -437,7 +516,7 @@ class ModuleSource(
          * codec, and it is the codec that settles it.
          */
         fun qualityTier(label: String): String? {
-            val text = label.uppercase()
+            val text = label.uppercase(Locale.ROOT)
             return when {
                 text.isBlank() -> null
                 LOSSLESS_HINTS.any { it in text } -> LOSSLESS
@@ -477,6 +556,19 @@ class ModuleSource(
          * routinely the one holding the lossless copy.
          */
         const val SEARCH_PATIENT_MS = 25_000L
+
+        /**
+         * How long the stragglers get once someone useful has answered, on the
+         * patient path.
+         *
+         * The counterpart to [SEARCH_GRACE_MS], sized for a caller that is not
+         * holding up audio: long enough for a slow-but-working module to land
+         * its answer and be compared, short enough that a module which is not
+         * going to answer at all cannot define the cost of the track. Ends the
+         * search the moment everyone has spoken, so a healthy index never
+         * spends any of it.
+         */
+        const val SEARCH_PATIENT_GRACE_MS = 8_000L
 
         /**
          * Delimiter between the module id and the upstream track id inside

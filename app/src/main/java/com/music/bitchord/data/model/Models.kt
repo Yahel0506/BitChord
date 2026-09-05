@@ -15,6 +15,12 @@ data class Song(
     /** A music-video upload rather than the catalogue track. */
     val isVideo: Boolean = false,
     /**
+     * True for a video upload and for its manually selected catalogue match.
+     * The latter remains video-origin so playback policies such as AutoMix do
+     * not mistake a converted video for a normal music track.
+     */
+    val isVideoOrigin: Boolean = isVideo,
+    /**
      * This track's identity *within one playlist*, which is not its [videoId]:
      * the same song added twice is two entries with two set-video-ids, and
      * removing one of them is only expressible in those terms. Present only on
@@ -29,15 +35,30 @@ data class Song(
      */
     val fromAutoplay: Boolean = false,
     /**
+     * The seed title of an explicitly started radio queue. Every item in that
+     * queue carries the same value, so the player can keep naming the station
+     * across skips and queue edits without holding UI-only session state.
+     */
+    val radioName: String? = null,
+    /**
      * Explicit content or file URI for local device tracks or downloaded audio.
      */
     val localUri: String? = null,
+    /** A premium rendition marker recorded by BitChord for its Downloads list. */
+    val downloadFormat: String? = null,
     /**
      * Real filesystem path backing [localUri], when MediaStore exposes one.
      * Lets playback swap a content:// row for a raw file:// path on formats
      * that need it — see [com.music.bitchord.playback.toMediaItem].
      */
     val localPath: String? = null,
+    /** Sidecar URI for locally stored synchronized lyrics (.lrc / .ttml). */
+    val localLyricsUri: String? = null,
+    val localLyricsSource: String? = null,
+    val localLyricsFormat: String? = null,
+    /** MediaStore timestamps used only to sort device and downloaded libraries. */
+    val localDateAddedSeconds: Long? = null,
+    val localDateModifiedSeconds: Long? = null,
     /**
      * What a non-YouTube source says it can serve this recording at, as one of
      * `LOSSLESS`, `HIGH` or `LOW` — null for every row that didn't come from
@@ -51,6 +72,8 @@ data class Song(
      * the track played as a 128kbps MP3.
      */
     val sourceQuality: String? = null,
+    /** Explicit-content state from the catalogue; null when that source does not say. */
+    val isExplicit: Boolean? = null,
 )
 
 /**
@@ -67,6 +90,60 @@ data class Song(
  * Video thumbnails carry no hint and are returned unchanged.
  */
 fun Song.artworkAt(px: Int): String? = thumbnailUrl.artworkAt(px)
+
+/**
+ * Whether a row is the track the player is on, for the now-playing highlight.
+ *
+ * Title and credit, matched exactly, and nothing else. Every id a row could be
+ * matched on instead is scoped to where the row came from and so lies when
+ * asked across that boundary: a set-video-id names a slot in one playlist, and
+ * two playlists hand the same one to unrelated tracks, which is what used to
+ * light up a stranger's row while something else played. A video id is no
+ * better across catalogues — the same recording arrives with a different id
+ * from a local file, a download and a module source, and the highlight would
+ * simply go missing.
+ *
+ * The cost is that name and credit are not unique: an album track and its
+ * appearance on a compilation are one and the same to this, and both light up.
+ * That is the trade the highlight is meant to make — it says "this is the song
+ * you are hearing", not "this is the queue entry you are hearing".
+ *
+ * The one place that must not use this is the player's own queue, where the
+ * entry, not the song, is what the row stands for — that list matches on
+ * position.
+ */
+fun Song.isSameTrackAs(other: Song?): Boolean {
+    other ?: return false
+    return title == other.title && artist == other.artist
+}
+
+/**
+ * [Song.durationText] in milliseconds, or 0 when the row didn't state one.
+ *
+ * A row's duration is a display string — YouTube sends `"3:45"`, not a
+ * number — and anything that has to *reason* about the length rather than draw
+ * it needs it back as a quantity. Lyrics matching is the case that forced this
+ * out into the open: LRCLIB keys its exact lookup on the track's length, and
+ * falls back to whichever fuzzy hit is closest to it, so a duration of zero
+ * doesn't miss — it silently matches the shortest edit of the song in the
+ * database and hands back timings for a different recording.
+ *
+ * Zero is the answer for anything that isn't a duration, including null, so a
+ * caller has one thing to check rather than a nullable *and* a range.
+ */
+fun Song.durationMillis(): Long = durationText.durationMillis()
+
+/** As [Song.durationMillis], for a `M:SS` or `H:MM:SS` string on its own. */
+fun String?.durationMillis(): Long {
+    val parts = this?.trim()?.takeIf { it.isNotEmpty() }?.split(":") ?: return 0L
+    val numbers = parts.map { it.trim().toLongOrNull() ?: return 0L }
+    val seconds = when (numbers.size) {
+        2 -> numbers[0] * 60 + numbers[1]
+        3 -> numbers[0] * 3_600 + numbers[1] * 60 + numbers[2]
+        else -> return 0L
+    }
+    return (seconds * 1_000).coerceAtLeast(0L)
+}
 
 /** As [Song.artworkAt], for artwork that isn't a track's. */
 fun String?.artworkAt(px: Int): String? = this?.replace(SIZE_HINT, "w$px-h$px")
@@ -93,6 +170,19 @@ const val HEADER_ART_PX = 720
  */
 const val NOTIFICATION_ART_PX = 544
 
+/**
+ * Artwork for the full player — the sleeve and the full-bleed banner both, and
+ * the largest rung on the ladder.
+ *
+ * Named here rather than left as a private constant in the player because the
+ * home-screen widget picks its own size off this ladder, and a size only one
+ * surface asks for is a cache entry only that surface fills. A large widget and
+ * an open player were fetching the same cover twice at two sizes, and either
+ * fetch could fail on its own — so the two could disagree about whether the
+ * track had artwork at all.
+ */
+const val PLAYER_ART_PX = 1200
+
 enum class BrowseType { ALBUM, ARTIST, PLAYLIST, OTHER }
 
 /** A non-track search result: album, artist or playlist. */
@@ -106,12 +196,17 @@ data class BrowseItem(
 
 /** Search rows are heterogeneous once filters other than "Songs" are used. */
 sealed interface SearchResult {
+    /** The promoted card returned only at the head of an unfiltered search. */
+    data class TopTrack(val song: Song) : SearchResult
     data class Track(val song: Song) : SearchResult
     data class Browse(val item: BrowseItem) : SearchResult
 }
 
 enum class SearchFilter(val label: String, val params: String?) {
+    /** YouTube Music's mixed search page: songs, artists, albums and playlists. */
+    ALL("All", null),
     SONGS("Songs", "EgWKAQIIAWoKEAkQChAFEAMQBA=="),
+    VIDEOS("Videos", "EgWKAQIQAWoKEAkQChAFEAMQBA=="),
     ALBUMS("Albums", "EgWKAQIYAWoKEAkQChAFEAMQBA=="),
     ARTISTS("Artists", "EgWKAQIgAWoKEAkQChAFEAMQBA=="),
     PLAYLISTS("Playlists", "EgWKAQIoAWoKEAkQChAFEAMQBA=="),
@@ -133,6 +228,36 @@ data class Account(
     val thumbnailUrl: String?,
 )
 
+/**
+ * One identity the signed-in session can act as: the Google account's own
+ * channel, plus any brand channel it owns.
+ *
+ * A brand channel is a separate YouTube identity attached to the same login,
+ * and YouTube Music treats it as a separate listener — its own library, likes,
+ * history and recommendations. Nothing in the cookie says which one is meant,
+ * so a client that never asks gets whichever one the web player happens to
+ * default to, which is why a listener whose music lives on a brand channel
+ * signs in and is shown a stranger's account.
+ *
+ * @param pageId `X-Goog-PageId`. Null for the account's own channel, which is
+ *   not a delegated page and must not be given one.
+ * @param dataSyncId `context.user.onBehalfOfUser`, taken from the switcher's
+ *   `datasyncIdToken` — never guessed, since Google answers one it cannot tie
+ *   to the session with 401.
+ */
+data class AccountChannel(
+    val name: String,
+    val subtitle: String,
+    val thumbnailUrl: String?,
+    val pageId: String?,
+    val dataSyncId: String?,
+    /** Whether YouTube's own switcher marks this as the session's active one. */
+    val activeOnWeb: Boolean,
+) {
+    /** Identity of the selection, stable across refetches of the list. */
+    val key: String get() = pageId ?: dataSyncId ?: name
+}
+
 data class HomeShelf(
     val title: String,
     val items: List<ShelfItem>,
@@ -144,6 +269,21 @@ data class HomeShelf(
 data class HomeFeed(
     val shelves: List<HomeShelf>,
     val continuation: String?,
+)
+
+/** One server-defined group of the buttons shown on Explore. */
+data class MoodGenreSection(
+    val title: String,
+    val items: List<MoodGenre>,
+)
+
+/** A mood or genre button and the exact browse request that it represents. */
+data class MoodGenre(
+    val title: String,
+    val browseId: String,
+    val params: String?,
+    /** First real cover from the category's playlist shelves, loaded in the background. */
+    val thumbnailUrl: String? = null,
 )
 
 /**
@@ -183,6 +323,22 @@ data class DetailPage(
      * album or playlist fetched with a session; see [LibraryState].
      */
     val library: LibraryState? = null,
+    /**
+     * The editorial blurb YouTube Music writes for a release or an artist —
+     * absent for most playlists, which is also why the "About" section only
+     * ever shows for an album or an artist page.
+     */
+    val description: String? = null,
+    /** "1.2M subscribers" off an artist page's header — see [ArtistPage.subscriberCountText]. */
+    val subscriberCountText: String? = null,
+    /** "3.4M monthly listeners" off an artist page's header. */
+    val monthlyListenerCount: String? = null,
+    /**
+     * Whether this artist's channel can be subscribed to and whether it already
+     * is — null when the page doesn't offer it. Only ever set for an artist page
+     * fetched with a session; see [SubscriptionState].
+     */
+    val subscription: SubscriptionState? = null,
 )
 
 /**
@@ -199,6 +355,20 @@ data class LibraryState(
     val saved: Boolean,
 )
 
+/**
+ * Whether an artist's channel is subscribed to, and the channel that changes.
+ *
+ * An artist page is a channel page underneath, and subscribing is the YouTube
+ * verb rather than a Music one: it takes the `UC…` channel id, which is also the
+ * page's own browse id. Read off the header's subscribe button rather than
+ * assumed from the browse id, because the button is also what says whether
+ * YouTube offers the action here at all.
+ */
+data class SubscriptionState(
+    val channelId: String,
+    val subscribed: Boolean,
+)
+
 /** Parsed artist landing page. */
 data class ArtistPage(
     val songs: List<Song>,
@@ -209,6 +379,14 @@ data class ArtistPage(
     val thumbnailUrl: String? = null,
     /** The single artist this page is for, as the header bills them. */
     val name: String? = null,
+    /** The artist bio YouTube Music writes for the page, when it has one. */
+    val description: String? = null,
+    /** "1.2M subscribers" — the artist's YouTube channel, when subscribed counts are shown. */
+    val subscriberCountText: String? = null,
+    /** "3.4M monthly listeners", off the same header. */
+    val monthlyListenerCount: String? = null,
+    /** The header's subscribe button, when the page carries one. */
+    val subscription: SubscriptionState? = null,
 )
 
 /**

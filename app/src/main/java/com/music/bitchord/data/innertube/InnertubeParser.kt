@@ -1,22 +1,28 @@
 package com.music.bitchord.data.innertube
 
 import com.music.bitchord.data.model.Account
+import com.music.bitchord.data.model.AccountChannel
 import com.music.bitchord.data.model.ArtistPage
 import com.music.bitchord.data.model.BrowseItem
 import com.music.bitchord.data.model.BrowseType
 import com.music.bitchord.data.model.HomeShelf
 import com.music.bitchord.data.model.LibraryState
 import com.music.bitchord.data.model.LikeStatus
+import com.music.bitchord.data.model.MoodGenre
+import com.music.bitchord.data.model.MoodGenreSection
 import com.music.bitchord.data.model.SearchResult
 import com.music.bitchord.data.model.ShelfItem
 import com.music.bitchord.data.model.Song
 import com.music.bitchord.data.model.SongMenu
+import com.music.bitchord.data.model.SubscriptionState
 import com.music.bitchord.data.model.UserPlaylist
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.booleanOrNull
 import kotlinx.serialization.json.contentOrNull
+import java.util.Locale
 
 /**
  * Innertube responses are deeply nested and their shape drifts between
@@ -32,35 +38,64 @@ object InnertubeParser {
     fun parseSearchSongs(response: JsonObject): List<Song> =
         parseSearch(response).filterIsInstance<SearchResult.Track>().map { it.song }
 
+    /** One page of search rows, plus the token for the next page if YouTube offers one. */
+    data class SearchPage(val rows: List<SearchResult>, val continuation: String?)
+
     /**
      * Search results are heterogeneous: songs carry a videoId, while albums,
      * artists and playlists carry a browseId plus a page type. Both arrive as
      * `musicResponsiveListItemRenderer`, so each row is classified on the way out.
      */
-    fun parseSearch(response: JsonObject): List<SearchResult> {
+    fun parseSearch(response: JsonObject): List<SearchResult> = parseSearchPage(response).rows
+
+    fun parseSearchPage(response: JsonObject, includeVideos: Boolean = false): SearchPage {
         // The "All" tab spreads results across several shelf types (card shelf
-        // for the top result, then one shelf per category), and the shapes
-        // differ per filter. Walking for the row renderer itself is far more
-        // robust than chasing each container path.
+        // for the top result, then one shelf per category). Its promoted top
+        // result lives on the card itself, not in a responsive row, so read it
+        // first before walking the ordinary result rows.
+        val topResults: List<SearchResult> = if (includeVideos) emptyList() else {
+            collectRenderers(response, "musicCardShelfRenderer")
+                .mapNotNull { card ->
+                    parseCardShelfSong(card)?.let(SearchResult::TopTrack)
+                        ?: parseCardShelfBrowse(card)?.let(SearchResult::Browse)
+                }
+        }
         val rows = collectRenderers(response, "musicResponsiveListItemRenderer")
 
         val seen = HashSet<String>()
-        return rows.mapNotNull { renderer ->
+        val parsed = buildList {
+            topResults.forEach { result ->
+                when (result) {
+                    is SearchResult.TopTrack -> {
+                        // The mixed All page stays music-only; music-video uploads
+                        // belong exclusively to the dedicated Videos tab.
+                        if (!result.song.isVideo && seen.add("v:${result.song.videoId}")) add(result)
+                    }
+                    is SearchResult.Browse -> {
+                        if (seen.add("b:${result.item.browseId}")) add(result)
+                    }
+                    is SearchResult.Track -> Unit
+                }
+            }
+            rows.forEach { renderer ->
             // Browse rows are tested first: an album row also carries a
             // "play album" videoId in its overlay, so checking for a track
             // first would misread every album as a single song.
-            parseBrowseItem(renderer)?.let { item ->
-                return@mapNotNull if (seen.add("b:${item.browseId}")) {
-                    SearchResult.Browse(item)
+                val browse = parseBrowseItem(renderer)
+                if (browse != null) {
+                    if (seen.add("b:${browse.browseId}")) add(SearchResult.Browse(browse))
                 } else {
-                    null
+                    parseResponsiveListItem(renderer)?.let { song ->
+                        // The mixed All page stays music-only; the dedicated Videos
+                        // filter is the one place music-video uploads belong.
+                        if (song.isVideo == includeVideos && seen.add("v:${song.videoId}")) {
+                            add(SearchResult.Track(song))
+                        }
+                    }
                 }
             }
-            parseResponsiveListItem(renderer)?.let { song ->
-                if (song.isVideo) return@mapNotNull null
-                if (seen.add("v:${song.videoId}")) SearchResult.Track(song) else null
-            }
         }
+        return SearchPage(parsed, continuationToken(response))
     }
 
     /**
@@ -154,6 +189,33 @@ object InnertubeParser {
     }
 
     /**
+     * The Moods & genres browse page is a set of navigation-button grids, not
+     * a normal carousel. Keep the browse params on every button: they select
+     * the playlist shelves that belong to that exact mood or genre.
+     */
+    fun parseMoodAndGenres(response: JsonObject): List<MoodGenreSection> {
+        val sections = response.o("contents")
+            .o("singleColumnBrowseResultsRenderer").a("tabs")?.firstOrNull()
+            .o("tabRenderer").o("content").o("sectionListRenderer").a("contents")
+            .orEmpty()
+        return sections.mapNotNull { section ->
+            val grid = section.o("gridRenderer") ?: return@mapNotNull null
+            val title = grid.o("header").o("gridHeaderRenderer").o("title").runs()
+            val items = grid.a("items").orEmpty().mapNotNull { item ->
+                val button = item.o("musicNavigationButtonRenderer") ?: return@mapNotNull null
+                val endpoint = button.o("clickCommand").o("browseEndpoint")
+                    ?: button.o("navigationEndpoint").o("browseEndpoint")
+                    ?: return@mapNotNull null
+                val browseId = endpoint.s("browseId") ?: return@mapNotNull null
+                val label = button.o("buttonText").runs().takeIf { it.isNotBlank() }
+                    ?: return@mapNotNull null
+                MoodGenre(label, browseId, endpoint.s("params"))
+            }
+            if (title.isBlank() || items.isEmpty()) null else MoodGenreSection(title, items)
+        }
+    }
+
+    /**
      * More Home shelves off a continuation response.
      *
      * Unlike the first page, a continuation envelope doesn't repeat the
@@ -196,6 +258,10 @@ object InnertubeParser {
                     ?.let { song ->
                         ShelfItem(song.title, song.artist, song.thumbnailUrl, song.videoId, null)
                     }
+                // A chart row with nothing to play — "Top artists" lists the
+                // artist alone, no track — falls through parseResponsiveListItem
+                // (it demands a videoId) and used to drop the whole shelf.
+                ?: parseArtistRow(item.o("musicResponsiveListItemRenderer"))
         }
         return if (items.isEmpty()) null else HomeShelf(title.ifBlank { "For you" }, items, strapline)
     }
@@ -256,8 +322,65 @@ object InnertubeParser {
             songs, moreSongs, shelves,
             thumbnailUrl = artistThumbnail(header),
             name = credit.artistName,
+            description = parseDescription(response),
+            subscriberCountText = subscriberCount(header),
+            monthlyListenerCount = monthlyListeners(header),
+            subscription = subscription(header),
         )
     }
+
+    /**
+     * The header's subscribe button, as state rather than as a label — see
+     * [SubscriptionState].
+     *
+     * Same two shapes [subscriberCount] has to cope with, and read in the same
+     * order. The channel id is taken off the button rather than off the browse
+     * id the page was fetched with: they are usually the same `UC…`, but a page
+     * reached through one of YouTube's aliases is the case where they aren't,
+     * and the button is the side that knows what it would act on.
+     */
+    private fun subscription(header: JsonElement?): SubscriptionState? {
+        val immersive = header.o("musicImmersiveHeaderRenderer") ?: return null
+        // Both shapes are tried rather than the first one found being trusted:
+        // the newer button is sometimes only the count, and a page that ships
+        // both is one where the state is on the other one.
+        return listOfNotNull(
+            immersive.o("subscriptionButton2").o("subscribeButtonRenderer"),
+            immersive.o("subscriptionButton").o("subscribeButtonRenderer"),
+        ).firstNotNullOfOrNull { button ->
+            // Absent on a signed-out response, where the button is only ever an
+            // invitation to sign in and toggling it would be a write with
+            // nothing behind it.
+            val subscribed = (button["subscribed"] as? JsonPrimitive)?.booleanOrNull
+                ?: return@firstNotNullOfOrNull null
+            val channelId = button.s("channelId")
+                ?: button.a("serviceEndpoints")?.firstNotNullOfOrNull { endpoint ->
+                    (endpoint.o("subscribeEndpoint").a("channelIds")?.firstOrNull()
+                        as? JsonPrimitive)?.contentOrNull
+                }
+                ?: return@firstNotNullOfOrNull null
+            SubscriptionState(channelId = channelId, subscribed = subscribed)
+        }
+    }
+
+    /**
+     * "1.2M subscribers" off the artist header's subscribe button — YouTube
+     * ships two shapes of it depending on how the page was served, and the
+     * button itself carries the count under one of three different keys
+     * across those shapes.
+     */
+    private fun subscriberCount(header: JsonElement?): String? {
+        val immersive = header.o("musicImmersiveHeaderRenderer") ?: return null
+        val button2 = immersive.o("subscriptionButton2").o("subscribeButtonRenderer")
+        val button1 = immersive.o("subscriptionButton").o("subscribeButtonRenderer")
+        return button2.o("subscriberCountWithSubscribeText").firstRunText()
+            ?: button1.o("longSubscriberCountText").firstRunText()
+            ?: button1.o("shortSubscriberCountText").firstRunText()
+    }
+
+    /** "3.4M monthly listeners", off the same header as [subscriberCount]. */
+    private fun monthlyListeners(header: JsonElement?): String? =
+        header.o("musicImmersiveHeaderRenderer").o("monthlyListenerCount").firstRunText()
 
     /**
      * The name the page bills itself under. A track credited to a trio hands
@@ -352,25 +475,38 @@ object InnertubeParser {
         val scope: JsonElement = root.o("continuationContents")
             ?: root.o("contents").o("twoColumnBrowseResultsRenderer").o("secondaryContents")
             ?: return null
-        val looksLikePlaylist = collectRenderers(scope, "musicPlaylistShelfRenderer").isNotEmpty() ||
-            scope.o("musicPlaylistShelfContinuation") != null ||
-            collectRenderers(scope, "musicShelfRenderer").any { it.o("title").runs() == "Suggestions" }
-        if (!looksLikePlaylist) return null
+        val playlistScope = scope.o("musicPlaylistShelfContinuation")
+            ?: collectRenderers(scope, "musicPlaylistShelfRenderer").firstOrNull()
+        val suggestionShelves = collectRenderers(scope, "musicShelfRenderer")
+            .filter { it.o("title").runs() == "Suggestions" }
+        if (playlistScope == null && suggestionShelves.isEmpty()) return null
 
         val pageCredit = pageCredit(root)
-        val (songs, suggested) = collectRenderers(scope, "musicResponsiveListItemRenderer")
+        val songs = playlistScope?.let { playlist ->
+            collectRenderers(playlist, "musicResponsiveListItemRenderer")
+                .mapNotNull { parseResponsiveListItem(it, pageCredit) }
+                .distinctBy { it.videoId }
+        }.orEmpty()
+        val knownSongs = songs.mapTo(HashSet()) { it.videoId }
+        val suggested = suggestionShelves
+            .flatMap { collectRenderers(it, "musicResponsiveListItemRenderer") }
             .mapNotNull { parseResponsiveListItem(it, pageCredit) }
+            .filterNot { it.videoId in knownSongs }
             .distinctBy { it.videoId }
-            .partition { it.setVideoId != null }
         // The "Suggestions" shelf's own continuation reloads it with a fresh
         // batch rather than paging it (see its "Refresh" button, wired to a
-        // `reloadContinuationData` token) — only the real `nextContinuationData`
-        // / `continuationItemRenderer` found in scope means more to fetch.
-        val token = collectRenderers(scope, "continuationItemRenderer").firstOrNull()
-            .o("continuationEndpoint").o("continuationCommand").s("token")
-            ?: collectRenderers(scope, "nextContinuationData").firstOrNull().s("continuation")
+        // `reloadContinuationData` token). Only the playlist shelf's own
+        // continuation means more real tracks.
+        val token = playlistScope?.let { playlist ->
+            collectRenderers(playlist, "continuationItemRenderer").firstOrNull()
+                .o("continuationEndpoint").o("continuationCommand").s("token")
+                ?: collectRenderers(playlist, "nextContinuationData").firstOrNull().s("continuation")
+        }
         return PlaylistShelfPage(songs, suggested, token)
     }
+
+    /** One page of saved library cards, plus the token for the next page. */
+    data class LibraryItemPage(val items: List<ShelfItem>, val continuation: String?)
 
     /**
      * The cards on a library feed — saved playlists, albums, artists, podcasts.
@@ -379,7 +515,9 @@ object InnertubeParser {
      * view, and serve `musicTwoRowItemRenderer` cards for one and
      * `musicResponsiveListItemRenderer` rows for the other, so both are read.
      */
-    fun parseLibraryItems(root: JsonElement): List<ShelfItem> {
+    fun parseLibraryItems(root: JsonElement): List<ShelfItem> = parseLibraryItemPage(root).items
+
+    fun parseLibraryItemPage(root: JsonElement): LibraryItemPage {
         val out = LinkedHashMap<String, ShelfItem>()
         collectRenderers(root, "musicTwoRowItemRenderer").forEach { renderer ->
             val item = parseTwoRowItem(renderer) ?: return@forEach
@@ -392,7 +530,7 @@ object InnertubeParser {
                 ShelfItem(item.title, item.subtitle, item.thumbnailUrl, null, item.browseId),
             )
         }
-        return out.values.toList()
+        return LibraryItemPage(out.values.toList(), continuationToken(root))
     }
 
     /**
@@ -433,14 +571,27 @@ object InnertubeParser {
         val subtitle = columns.getOrNull(1)
             .o("musicResponsiveListItemFlexColumnRenderer").o("text").runs()
         val parts = subtitle.split(" • ").filter { it.isNotBlank() }
+        // A search row states its runtime in the subtitle; an album's own rows
+        // do not — the release is billed once in the header and the per-track
+        // duration sits in a `fixedColumns` entry off to the right instead.
+        // Nothing here read that column, so every track parsed off an album page
+        // came back with a null duration, and two things downstream quietly got
+        // worse for it: [LyricsTag.forTrack] fell back to matching on title and
+        // artist alone against providers that key on runtime, and
+        // [TrackMatcher] lost the one check that separates the album cut from
+        // the extended mix sitting beside it in a source's search results.
         val duration = parts.lastOrNull()?.takeIf { it.matches(DURATION) }
+            ?: renderer.a("fixedColumns").orEmpty().firstNotNullOfOrNull { column ->
+                column.o("musicResponsiveListItemFixedColumnRenderer")
+                    .o("text").runs().takeIf { it.matches(DURATION) }
+            }
         // On the "All" tab the first segment is the row type ("Song", "Video"),
         // not the artist — skip those so the subtitle reads like a credit.
-        val rowType = parts.firstOrNull { it.lowercase() in TYPE_WORDS }?.lowercase()
+        val rowType = parts.firstOrNull { it.lowercase(Locale.ROOT) in TYPE_WORDS }?.lowercase(Locale.ROOT)
         // A track row on an album lists its play count where a search row
         // lists the artist, so a segment that reads as a tally is no credit.
         val artist = parts.firstOrNull {
-            !it.matches(DURATION) && it.lowercase() !in TYPE_WORDS && !it.matches(TALLY)
+            !it.matches(DURATION) && it.lowercase(Locale.ROOT) !in TYPE_WORDS && !it.matches(TALLY)
         }
 
         // The artist/album names in the subtitle carry browse endpoints; pull
@@ -478,6 +629,105 @@ object InnertubeParser {
             // otherwise a music-video upload gives itself away with widescreen
             // art where a catalogue track has square album cover art.
             isVideo = rowType == "video" || thumbnails.isNotSquare(),
+            isExplicit = renderer.hasExplicitBadge(),
+        )
+    }
+
+    /**
+     * The promoted result at the top of an unfiltered search is a
+     * `musicCardShelfRenderer`. Unlike the rows below it, its playable id and
+     * credits are placed directly on the card, so it would otherwise vanish
+     * from the All tab while remaining first in the Songs tab.
+     */
+    private fun parseCardShelfSong(renderer: JsonObject): Song? {
+        val videoId = renderer.o("onTap").o("watchEndpoint").s("videoId") ?: return null
+        val title = renderer.o("title").runs()
+        if (title.isBlank()) return null
+
+        val subtitleRuns = renderer.o("subtitle").a("runs").orEmpty()
+        val subtitle = subtitleRuns.joinToString("") { it.s("text").orEmpty() }
+        val parts = subtitle.split(" • ").filter { it.isNotBlank() }
+        val duration = parts.lastOrNull()?.takeIf { it.matches(DURATION) }
+        val rowType = parts.firstOrNull { it.lowercase(Locale.ROOT) in TYPE_WORDS }
+            ?.lowercase(Locale.ROOT)
+        val credits = creditsOf(subtitleRuns)
+        val artist = parts.firstOrNull {
+            !it.matches(DURATION) && it.lowercase(Locale.ROOT) !in TYPE_WORDS && !it.matches(TALLY)
+        }
+        val thumbnails = renderer.o("thumbnail").o("musicThumbnailRenderer")
+            .o("thumbnail").a("thumbnails")
+
+        return Song(
+            videoId = videoId,
+            title = title,
+            artist = credits.artistName?.takeIf { it.isNotBlank() } ?: artist ?: "Unknown artist",
+            thumbnailUrl = thumbnails.best(),
+            durationText = duration,
+            artistId = credits.artistId,
+            albumId = credits.albumId,
+            albumName = credits.albumName,
+            isVideo = rowType == "video" || thumbnails.isNotSquare(),
+            isExplicit = renderer["subtitleBadges"].hasExplicitBadge(),
+        )
+    }
+
+    /** Artist, album and playlist cards use the same promoted-search container as a song. */
+    private fun parseCardShelfBrowse(renderer: JsonObject): BrowseItem? {
+        val endpoint = renderer.o("onTap").o("browseEndpoint") ?: return null
+        val browseId = endpoint.s("browseId") ?: return null
+        val pageType = endpoint.o("browseEndpointContextSupportedConfigs")
+            .o("browseEndpointContextMusicConfig").s("pageType").orEmpty()
+        val title = renderer.o("title").runs()
+        if (title.isBlank()) return null
+        val subtitle = renderer.o("subtitle").runs()
+        if (VIDEO_WORD.containsMatchIn(title) || VIDEO_WORD.containsMatchIn(subtitle)) return null
+
+        return BrowseItem(
+            browseId = browseId,
+            title = title,
+            subtitle = subtitle,
+            thumbnailUrl = renderer.o("thumbnail").o("musicThumbnailRenderer")
+                .o("thumbnail").a("thumbnails").best(),
+            type = when {
+                "ALBUM" in pageType -> BrowseType.ALBUM
+                "ARTIST" in pageType -> BrowseType.ARTIST
+                "PLAYLIST" in pageType -> BrowseType.PLAYLIST
+                else -> BrowseType.OTHER
+            },
+        )
+    }
+
+    /**
+     * A chart row that names an artist rather than a track — "Top artists"
+     * on the Charts page lists 40 of them with no song attached, so there is
+     * no `videoId` for [parseResponsiveListItem] to key off and it returns
+     * null for every one. Read here off the row's own `navigationEndpoint`
+     * instead (the flex columns carry only the name and a subscriber count)
+     * and pointed at the artist page rather than dropped.
+     */
+    private fun parseArtistRow(renderer: JsonObject?): ShelfItem? {
+        if (renderer == null) return null
+        val endpoint = renderer.o("navigationEndpoint").o("browseEndpoint")
+        val pageType = endpoint.o("browseEndpointContextSupportedConfigs")
+            .o("browseEndpointContextMusicConfig").s("pageType").orEmpty()
+        if ("ARTIST" !in pageType) return null
+        val browseId = endpoint.s("browseId") ?: return null
+
+        val columns = renderer.a("flexColumns").orEmpty()
+        val title = columns.getOrNull(0)
+            .o("musicResponsiveListItemFlexColumnRenderer").o("text").runs()
+        if (title.isBlank()) return null
+        val subtitle = columns.getOrNull(1)
+            .o("musicResponsiveListItemFlexColumnRenderer").o("text").runs()
+
+        val thumbnails = renderer.o("thumbnail").o("musicThumbnailRenderer")
+            .o("thumbnail").a("thumbnails")
+        return ShelfItem(
+            title = title,
+            subtitle = subtitle,
+            thumbnailUrl = thumbnails.best(),
+            videoId = null,
+            browseId = browseId,
         )
     }
 
@@ -533,17 +783,84 @@ object InnertubeParser {
         val parts = lines.flatMap { line ->
             line.joinToString("") { it.s("text").orEmpty() }.split(" • ").map(String::trim)
         }
-        if (parts.none { it.lowercase() in RELEASE_WORDS }) return Credits()
+        if (parts.none { it.lowercase(Locale.ROOT) in RELEASE_WORDS }) return Credits()
 
         val credits = creditsOf(lines.flatten())
         if (credits.artistName?.isNotBlank() == true) return credits
         // An artist YouTube has no page for is named in the same line without
         // a link to follow, leaving the name as the only thing to go on.
         val name = parts.firstOrNull {
-            it.isNotBlank() && it.lowercase() !in TYPE_WORDS && !it.matches(TALLY) &&
+            it.isNotBlank() && it.lowercase(Locale.ROOT) !in TYPE_WORDS && !it.matches(TALLY) &&
                 !it.matches(YEAR) && !it.matches(DURATION)
         }
         return credits.copy(artistName = name)
+    }
+
+    /** How an album or playlist page bills itself, off its own header. */
+    data class BrowseHeader(
+        val title: String,
+        /** The line under it — "Album • Artist • 2024", or a playlist's blurb. */
+        val subtitle: String,
+        val thumbnailUrl: String?,
+    )
+
+    /**
+     * What a release or playlist page calls itself.
+     *
+     * Every other way into a detail page comes from a card that already carried
+     * the name and the cover, so nothing used to have to ask. A YouTube Music
+     * link tapped outside the app carries a browse id and nothing else — see
+     * [com.music.bitchord.playback.MusicLink] — and a page with a blank title
+     * over a track list reads as the app having half-loaded.
+     */
+    fun parseBrowseHeader(root: JsonElement): BrowseHeader? {
+        val header = HEADER_RENDERERS.firstNotNullOfOrNull {
+            collectRenderers(root, it).firstOrNull()
+        } ?: return null
+        val title = header.o("title").runs()
+        if (title.isBlank()) return null
+        // Current headers split the artist and release details across these two
+        // lines: the strapline has the artist, while the subtitle holds
+        // "Album • 2024". Keep both; taking only the first silently loses the
+        // release year on album pages. Older headers put everything in one of
+        // the two lines, which is covered as well.
+        val subtitle = HEADER_CREDIT_LINES
+            .map { header.o(it).runs() }
+            .filter { it.isNotBlank() }
+            .distinct()
+            .joinToString(" • ")
+        return BrowseHeader(
+            title = title,
+            subtitle = subtitle,
+            // Header shapes drift — a cropped square here, a plain thumbnail
+            // there — so the first image under the header is the cover.
+            thumbnailUrl = collectRenderers(header, "musicThumbnailRenderer").firstOrNull()
+                .o("thumbnail").a("thumbnails").best(),
+        )
+    }
+
+    /**
+     * The editorial blurb YouTube Music writes for a release or an artist —
+     * "About the album" / "About the artist" on the web player.
+     *
+     * It arrives as its own shelf (`musicDescriptionShelfRenderer`) on a
+     * current-layout page, but the field also turns up directly on the
+     * header itself on some responses, so both are tried. Absent from a
+     * playlist page — YouTube writes these for its own catalogue, not for
+     * something a user put together — which is why callers only surface it
+     * for [com.music.bitchord.data.model.BrowseType.ALBUM] and
+     * [com.music.bitchord.data.model.BrowseType.ARTIST].
+     */
+    fun parseDescription(root: JsonElement): String? {
+        val shelf = collectRenderers(root, "musicDescriptionShelfRenderer")
+            .firstOrNull()?.o("description").runs()
+        if (shelf.isNotBlank()) return shelf
+        val onHeader = (HEADER_RENDERERS + "musicImmersiveHeaderRenderer")
+            .firstNotNullOfOrNull { name ->
+                collectRenderers(root, name).firstOrNull()
+                    ?.o("description").runs().takeIf { it.isNotBlank() }
+            }
+        return onHeader
     }
 
     /**
@@ -565,6 +882,49 @@ object InnertubeParser {
             thumbnailUrl = header.o("accountPhoto").a("thumbnails").best(),
         )
     }
+
+    /**
+     * The channels a switcher response offers, in the order YouTube lists them.
+     *
+     * Read by scanning for `accountItem` rather than by walking a fixed path:
+     * the two endpoints that produce this list ([Innertube.accountsList] and
+     * [Innertube.accountSwitcher]) wrap the same item renderer in different
+     * envelopes, and the wrapper is not the part worth agreeing on.
+     *
+     * The two tokens are likewise found by name anywhere inside the item. They
+     * arrive as a list of single-key objects under `supportedTokens`, in no
+     * promised order and alongside tokens meant for other purposes, so a
+     * positional read of that list would be a guess about a structure Google
+     * never said was ordered.
+     *
+     * An entry with neither token is dropped. There would be nothing to send
+     * for it, and offering a channel that silently keeps the current one is
+     * worse than not listing it.
+     */
+    fun parseAccountChannels(root: JsonElement): List<AccountChannel> =
+        collectRenderers(root, "accountItem").mapNotNull { item ->
+            val name = item.o("accountName").runs()
+                .ifBlank { item.o("accountName").s("simpleText").orEmpty() }
+            if (name.isBlank()) return@mapNotNull null
+            val pageId = item.findString("pageId")
+            // `<accountSyncId>||<sessionSyncId>`; only the first half names the
+            // account, exactly as in the shell's own DATASYNC_ID.
+            val dataSyncId = item.findString("datasyncIdToken")
+                ?.substringBefore("||")
+                ?.takeIf { it.isNotBlank() }
+            if (pageId == null && dataSyncId == null) return@mapNotNull null
+            AccountChannel(
+                name = name,
+                subtitle = item.o("channelHandle").runs()
+                    .ifBlank { item.o("channelHandle").s("simpleText").orEmpty() }
+                    .ifBlank { item.o("accountByline").runs() }
+                    .ifBlank { item.o("accountByline").s("simpleText").orEmpty() },
+                thumbnailUrl = item.o("accountPhoto").a("thumbnails").best(),
+                pageId = pageId,
+                dataSyncId = dataSyncId,
+                activeOnWeb = (item["isSelected"] as? JsonPrimitive)?.content == "true",
+            )
+        }.distinctBy { it.key }
 
     /** Tracks of a watch queue (`next` response) — the AutoPlay radio mix. */
     fun parseWatchQueue(root: JsonElement): List<Song> {
@@ -593,6 +953,7 @@ object InnertubeParser {
                 // A catalogue track is credited "Artist • Album • Year"; the
                 // matching music video is "Artist • 417M views • 2.4M likes".
                 isVideo = byline.any { it.contains("views", ignoreCase = true) },
+                isExplicit = renderer.hasExplicitBadge(),
             )
         }
         return out.values.toList()
@@ -727,6 +1088,55 @@ object InnertubeParser {
             o("toggledIcon").s("iconType") == "BOOKMARK"
 
     /**
+     * Whether a playlist page is one the account *made*, rather than one it
+     * merely saved — null when the response doesn't say either way.
+     *
+     * The library feed can't answer this. `FEmusic_liked_playlists` lists a
+     * stranger's playlist this account saved in exactly the same shape as one
+     * this account created (see [parseUserPlaylists]), which is how Rename and
+     * Delete came to be offered on someone else's playlist. The page can
+     * answer, and does so three ways over:
+     *
+     *  - An own playlist's header comes wrapped in
+     *    `musicEditablePlaylistDetailHeaderRenderer` — YouTube's own words for
+     *    "this belongs to whoever is asking".
+     *  - Its header menu carries the Edit and Delete rows, read by icon rather
+     *    than by label for the same reason [isSaveToggle] is.
+     *  - Its header carries no save bookmark, and a saved playlist's always
+     *    does: there is nothing to save a playlist already yours *into*. So a
+     *    playlist header without one is this account's.
+     *
+     * Any one of the three is enough, because the two mistakes cost different
+     * amounts. Reading "saved" as "own" puts a Delete button on a playlist the
+     * account cannot delete; reading "own" as "saved" takes Rename and Delete
+     * off the user's own playlist, which is a feature quietly vanishing. Three
+     * readings rather than one so a layout change can only ever cause the
+     * first, which the edit endpoint would refuse anyway.
+     *
+     * Only meaningful for a `VL…` playlist page — an album has a save bookmark
+     * and no owner in this sense at all, and a continuation has no header.
+     */
+    fun parsePlaylistOwned(root: JsonElement): Boolean? {
+        if (collectRenderers(root, "musicEditablePlaylistDetailHeaderRenderer").isNotEmpty()) {
+            return true
+        }
+        // Scoped to the header, not walked for: every track row on the page
+        // carries its own menu, and a row's "Remove from playlist" would
+        // answer for the row rather than for the playlist.
+        val header = collectRenderers(root, "musicResponsiveHeaderRenderer").firstOrNull()
+            ?: return null
+        if (collectRenderers(header, "menuNavigationItemRenderer")
+                .any { it.o("icon").s("iconType") in OWNER_ICONS }
+        ) {
+            return true
+        }
+        return header.a("buttons").orEmpty().none { it.o("toggleButtonRenderer").isSaveToggle }
+    }
+
+    /** Header menu icons only the playlist's owner is offered. */
+    private val OWNER_ICONS = setOf("DELETE", "EDIT")
+
+    /**
      * The playlists the account can be asked to add a track to.
      *
      * `FEmusic_liked_playlists` also carries the "New playlist" tile (no
@@ -738,11 +1148,17 @@ object InnertubeParser {
      * ids are not as regular as they look, and a list that quietly drops the
      * user's own playlist is worse than one that offers a playlist the edit
      * endpoint then refuses — which it reports, and which the picker surfaces.
+     *
      * Whether a playlist is *owned* rather than merely saved isn't stated on
-     * this feed at all.
+     * this feed at all, so it isn't decided here: this stays the permissive
+     * list the picker wants, and [parsePlaylistOwned] is what rules a saved
+     * playlist out of being renamed or deleted.
      */
     fun parseUserPlaylists(root: JsonElement): List<UserPlaylist> =
-        parseLibraryItems(root).mapNotNull { item ->
+        parseUserPlaylists(parseLibraryItems(root))
+
+    fun parseUserPlaylists(items: List<ShelfItem>): List<UserPlaylist> =
+        items.mapNotNull { item ->
             val browseId = item.browseId ?: return@mapNotNull null
             if (!browseId.startsWith("VL")) return@mapNotNull null
             if (NOT_EDITABLE.any { browseId.startsWith("VL$it") }) return@mapNotNull null
@@ -795,11 +1211,38 @@ object InnertubeParser {
     }
 
     /**
+     * The credit out of a shelf card's subtitle, which reads "Song • Chelsea
+     * Wolfe" rather than just the artist — [parseTwoRowItem] keeps the whole
+     * line because the card shows it as billed, but starting a radio off the
+     * card and carrying that line into [Song.artist] would print the label
+     * everywhere the field is read afterwards: the player, the mini player,
+     * a shared link, a scrobble. Same split as [parseResponsiveListItem]'s
+     * subtitle, so a "Song" or "Single" heading drops out the same way.
+     */
+    fun artistFromSubtitle(subtitle: String): String {
+        val parts = subtitle.split(" • ").map(String::trim).filter { it.isNotBlank() }
+        return parts.firstOrNull {
+            it.lowercase() !in TYPE_WORDS && !it.matches(TALLY) && !it.matches(DURATION)
+        } ?: subtitle
+    }
+
+    /**
      * Playlist-id prefixes nothing can be added to: `LM` is Liked Music (a
      * song joins it by being liked), `SE` is Episodes for Later, `RD` is a
      * generated radio mix, and `OLAK`/`MPRE` are albums wearing a playlist id.
      */
     private val NOT_EDITABLE = listOf("LM", "SE", "RD", "OLAK", "MPRE")
+
+    /** YouTube nests this badge differently across search, album and queue renderers. */
+    private fun JsonElement?.hasExplicitBadge(): Boolean? =
+        true.takeIf {
+            when (this) {
+                is JsonPrimitive -> contentOrNull == "MUSIC_EXPLICIT_BADGE"
+                is JsonArray -> any { it.hasExplicitBadge() == true }
+                is JsonObject -> values.any { it.hasExplicitBadge() == true }
+                null -> false
+            }
+        }
 
     private val DURATION = Regex("""\d+:\d{2}""")
     private val YEAR = Regex("""\d{4}""")
@@ -845,8 +1288,25 @@ private fun JsonElement?.a(key: String): JsonArray? =
 private fun JsonElement?.s(key: String): String? =
     ((this as? JsonObject)?.get(key) as? JsonPrimitive)?.contentOrNull
 
+/**
+ * The first string under [key] anywhere in the subtree, by name rather than by
+ * path — for a value whose position is not promised. See [InnertubeParser.parseAccountChannels].
+ */
+private fun JsonElement?.findString(key: String): String? = when (this) {
+    is JsonObject -> {
+        (this[key] as? JsonPrimitive)?.contentOrNull
+            ?: values.firstNotNullOfOrNull { it.findString(key) }
+    }
+    is JsonArray -> firstNotNullOfOrNull { it.findString(key) }
+    else -> null
+}
+
 private fun JsonElement?.runs(): String =
     this.a("runs")?.joinToString("") { it.s("text").orEmpty() }.orEmpty()
+
+/** The first run's text alone — for a field that is a count or a label, never a sentence. */
+private fun JsonElement?.firstRunText(): String? =
+    this.a("runs")?.firstOrNull().s("text")
 
 /**
  * Last thumbnail is the largest, taken exactly as offered.

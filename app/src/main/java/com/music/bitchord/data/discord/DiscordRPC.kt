@@ -6,6 +6,7 @@ import com.music.bitchord.data.model.Song
 import com.music.bitchord.data.model.artworkAt
 import com.my.kizzy.rpc.KizzyRPC
 import com.my.kizzy.rpc.RpcImage
+import java.util.Locale
 
 /**
  * Publishes what's playing to Discord as a Rich Presence activity.
@@ -20,12 +21,12 @@ import com.my.kizzy.rpc.RpcImage
  * The presence Discord renders from one [updateSong] call:
  *
  * ```
- *   Listening to bitchord          <- activityName, or the app's own name
+ *   Listening to BitChord          <- activityName, or the app's own name
  *   ┌────┐  Song title             <- details
  *   │art │  Artist                 <- state
  *   └────┘  ▁▁▁▁▁▁ 1:04 / 3:47     <- from the timestamps
  *   [ Listen on YouTube Music ]    <- button 1
- *   [ Visit bitchord           ]   <- button 2
+ *   [ Visit BitChord           ]   <- button 2
  * ```
  */
 class DiscordRPC(
@@ -71,7 +72,7 @@ class DiscordRPC(
         val calculatedStartTime = currentTime - adjustedPlaybackTime
 
         val songTitleWithRate = if (playbackSpeed != 1.0f) {
-            "${song.title} [${String.format("%.2fx", playbackSpeed)}]"
+            "${song.title} [${String.format(Locale.ROOT, "%.2fx", playbackSpeed)}]"
         } else {
             song.title
         }
@@ -112,7 +113,15 @@ class DiscordRPC(
             // Asked for at a size Discord's own card actually draws — the row
             // thumbnail our lists use is 160px and reads soft blown up to the
             // 96dp sleeve in a presence card.
-            largeImage = song.artworkAt(ART_PX)?.let { RpcImage.ExternalImage(it) },
+            //
+            // Never left null: an activity without a large_image falls back to
+            // the icon of whichever application [APPLICATION_ID] points at, and
+            // that icon isn't ours to set. A track with no artwork — or with
+            // artwork Discord can't reach, which is anything that isn't an http
+            // URL — gets our own launcher icon instead.
+            largeImage = RpcImage.ExternalImage(
+                song.artworkAt(ART_PX)?.takeIf { it.startsWith("http") } ?: FALLBACK_ART_URL,
+            ),
             smallImage = null,
             largeText = song.albumName,
             smallText = null,
@@ -156,10 +165,20 @@ class DiscordRPC(
         const val PROJECT_URL = "https://github.com/kushagrasinghx/BitChord"
 
         const val DEFAULT_BUTTON_1 = "Listen on YouTube Music"
-        const val DEFAULT_BUTTON_2 = "Visit bitchord"
+        const val DEFAULT_BUTTON_2 = "Visit BitChord"
 
         /** Discord draws the sleeve at roughly 96dp; 480px covers it on any density. */
         private const val ART_PX = 480
+
+        /**
+         * The sleeve drawn for a track with no usable artwork.
+         *
+         * Has to be a URL Discord's mirroring endpoint can fetch, so it points
+         * at the launcher icon in the repo rather than the copy bundled in the
+         * APK — a `res/` drawable has no address the presence can carry.
+         */
+        private const val FALLBACK_ART_URL =
+            "https://raw.githubusercontent.com/kushagrasinghx/BitChord/main/app/src/main/ic_launcher-playstore.png"
 
         fun watchUrl(song: Song): String =
             "https://music.youtube.com/watch?v=${song.videoId}"

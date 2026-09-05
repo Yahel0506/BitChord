@@ -111,16 +111,14 @@ object BitChordIcons {
         }.build()
     }
 
-    val Repeat: ImageVector by lazy { repeatLoop("bc_repeat", withOne = false) }
-
-    val RepeatOne: ImageVector by lazy { repeatLoop("bc_repeat_one", withOne = true) }
+    val Repeat: ImageVector by lazy { repeatLoop("bc_repeat") }
 
     /**
      * Two straight runs joined by semicircles, with the arrow heads lying flat
      * at the ends of the straights. Putting them on the curves instead — as a
      * first pass did — makes the glyph read as a refresh/sync symbol.
      */
-    private fun repeatLoop(name: String, withOne: Boolean): ImageVector =
+    private fun repeatLoop(name: String): ImageVector =
         ImageVector.Builder(
             name = name,
             defaultWidth = 24.dp, defaultHeight = 24.dp,
@@ -141,11 +139,6 @@ object BitChordIcons {
                 // Direction of travel: right along the top, left along the bottom.
                 moveTo(13.5f, 5.7f); lineTo(15.4f, 7.6f); lineTo(13.5f, 9.5f)
                 moveTo(10.5f, 14.5f); lineTo(8.6f, 16.4f); lineTo(10.5f, 18.3f)
-
-                if (withOne) {
-                    // Slim "1" inside the loop
-                    moveTo(10.9f, 10.9f); lineTo(12.2f, 10f); lineTo(12.2f, 14f)
-                }
             }
         }.build()
 
@@ -354,6 +347,115 @@ object BitChordIcons {
         }.build()
     }
 
+    /**
+     * Clock face with two hands — a download asked for but not yet on disk.
+     *
+     * The dial is the same 8.6 radius as [Explore]'s, so the two sit at the same
+     * optical weight when they appear in the same row of header buttons. The
+     * hands are one polyline through the centre rather than two strokes: the
+     * round join is then the pivot, which is what stops the middle reading as a
+     * pair of lines that happen to cross.
+     */
+    val Clock: ImageVector by lazy {
+        ImageVector.Builder(
+            name = "bc_clock",
+            defaultWidth = 24.dp, defaultHeight = 24.dp,
+            viewportWidth = 24f, viewportHeight = 24f,
+        ).apply {
+            path(
+                stroke = stroke,
+                strokeLineWidth = STROKE,
+                strokeLineCap = StrokeCap.Round,
+                strokeLineJoin = StrokeJoin.Round,
+            ) {
+                // Dial (full circle from two arcs)
+                moveTo(3.4f, 12f)
+                arcToRelative(8.6f, 8.6f, 0f, isMoreThanHalf = true, isPositiveArc = true, 17.2f, 0f)
+                arcToRelative(8.6f, 8.6f, 0f, isMoreThanHalf = true, isPositiveArc = true, -17.2f, 0f)
+                // Minute hand up, hour hand down to the right
+                moveTo(12f, 7.4f); lineTo(12f, 12f); lineTo(15.4f, 13.8f)
+            }
+        }.build()
+    }
+
+    /**
+     * A pushpin, not a map marker: a round head with a straight needle
+     * kicked out to one side, the way it sits once it's stuck into something.
+     * A teardrop reads as "location" the moment it's this small — the two
+     * disjoint strokes here are what keep it read as "pinned" instead.
+     */
+    val Pin: ImageVector by lazy {
+        ImageVector.Builder(
+            name = "bc_pin",
+            defaultWidth = 24.dp, defaultHeight = 24.dp,
+            viewportWidth = 24f, viewportHeight = 24f,
+        ).apply {
+            path(
+                stroke = stroke,
+                strokeLineWidth = STROKE,
+                strokeLineCap = StrokeCap.Round,
+                strokeLineJoin = StrokeJoin.Round,
+            ) {
+                // Round head.
+                moveTo(9.6f, 8.4f)
+                arcToRelative(3.4f, 3.4f, 0f, isMoreThanHalf = true, isPositiveArc = true, 6.8f, 0f)
+                arcToRelative(3.4f, 3.4f, 0f, isMoreThanHalf = true, isPositiveArc = true, -6.8f, 0f)
+                // Needle, kicked out from the underside of the head to a point.
+                moveTo(10.8f, 10.8f)
+                lineTo(5.6f, 19.6f)
+            }
+        }.build()
+    }
+
+    /** Speed gauge used by high-performance display settings. */
+    val Performance: ImageVector by lazy {
+        ImageVector.Builder(
+            name = "bc_performance",
+            defaultWidth = 24.dp, defaultHeight = 24.dp,
+            viewportWidth = 24f, viewportHeight = 24f,
+        ).apply {
+            path(
+                stroke = stroke,
+                strokeLineWidth = STROKE,
+                strokeLineCap = StrokeCap.Round,
+                strokeLineJoin = StrokeJoin.Round,
+            ) {
+                // Open gauge, leaving room for the base line.
+                moveTo(4.1f, 16.8f)
+                arcToRelative(8.4f, 8.4f, 0f, isMoreThanHalf = true, isPositiveArc = true, 15.8f, 0f)
+                // Needle and hub.
+                moveTo(12f, 15.8f)
+                lineTo(16.7f, 9.3f)
+                moveTo(10.9f, 16.9f)
+                arcToRelative(1.1f, 1.1f, 0f, isMoreThanHalf = true, isPositiveArc = true, 2.2f, 0f)
+                arcToRelative(1.1f, 1.1f, 0f, isMoreThanHalf = true, isPositiveArc = true, -2.2f, 0f)
+                // Stable baseline.
+                moveTo(5.4f, 19.5f)
+                lineTo(18.6f, 19.5f)
+            }
+        }.build()
+    }
+
+    /** Four frame-time bars, used by refresh-rate selection. */
+    val FrameRate: ImageVector by lazy {
+        ImageVector.Builder(
+            name = "bc_frame_rate",
+            defaultWidth = 24.dp, defaultHeight = 24.dp,
+            viewportWidth = 24f, viewportHeight = 24f,
+        ).apply {
+            path(
+                stroke = stroke,
+                strokeLineWidth = STROKE,
+                strokeLineCap = StrokeCap.Round,
+            ) {
+                moveTo(5f, 15.5f); lineTo(5f, 8.5f)
+                moveTo(9.7f, 18.5f); lineTo(9.7f, 5.5f)
+                moveTo(14.3f, 16.5f); lineTo(14.3f, 7.5f)
+                moveTo(19f, 14.5f); lineTo(19f, 9.5f)
+            }
+        }.build()
+    }
+
     val Library: ImageVector by lazy {
         ImageVector.Builder(
             name = "bc_library",
@@ -371,6 +473,96 @@ object BitChordIcons {
                 moveTo(9.2f, 4.8f); lineTo(9.2f, 19.2f)
                 moveTo(13.8f, 4.8f); lineTo(13.8f, 19.2f)
                 moveTo(17.2f, 5.6f); lineTo(20.6f, 18.9f)
+            }
+        }.build()
+    }
+
+    /** 2x2 grid icon (4 rounded squares) for switching layout to grid view. */
+    val GridView: ImageVector by lazy {
+        ImageVector.Builder(
+            name = "bc_grid_view",
+            defaultWidth = 24.dp, defaultHeight = 24.dp,
+            viewportWidth = 24f, viewportHeight = 24f,
+        ).apply {
+            path(
+                stroke = stroke,
+                strokeLineWidth = STROKE,
+                strokeLineCap = StrokeCap.Round,
+                strokeLineJoin = StrokeJoin.Round,
+            ) {
+                // Top-left
+                moveTo(6.5f, 4.5f)
+                lineTo(8.5f, 4.5f)
+                arcToRelative(2f, 2f, 0f, isMoreThanHalf = false, isPositiveArc = true, 2f, 2f)
+                lineTo(10.5f, 8.5f)
+                arcToRelative(2f, 2f, 0f, isMoreThanHalf = false, isPositiveArc = true, -2f, 2f)
+                lineTo(6.5f, 10.5f)
+                arcToRelative(2f, 2f, 0f, isMoreThanHalf = false, isPositiveArc = true, -2f, -2f)
+                lineTo(4.5f, 6.5f)
+                arcToRelative(2f, 2f, 0f, isMoreThanHalf = false, isPositiveArc = true, 2f, -2f)
+                close()
+
+                // Top-right
+                moveTo(15.5f, 4.5f)
+                lineTo(17.5f, 4.5f)
+                arcToRelative(2f, 2f, 0f, isMoreThanHalf = false, isPositiveArc = true, 2f, 2f)
+                lineTo(19.5f, 8.5f)
+                arcToRelative(2f, 2f, 0f, isMoreThanHalf = false, isPositiveArc = true, -2f, 2f)
+                lineTo(15.5f, 10.5f)
+                arcToRelative(2f, 2f, 0f, isMoreThanHalf = false, isPositiveArc = true, -2f, -2f)
+                lineTo(13.5f, 6.5f)
+                arcToRelative(2f, 2f, 0f, isMoreThanHalf = false, isPositiveArc = true, 2f, -2f)
+                close()
+
+                // Bottom-left
+                moveTo(6.5f, 13.5f)
+                lineTo(8.5f, 13.5f)
+                arcToRelative(2f, 2f, 0f, isMoreThanHalf = false, isPositiveArc = true, 2f, 2f)
+                lineTo(10.5f, 17.5f)
+                arcToRelative(2f, 2f, 0f, isMoreThanHalf = false, isPositiveArc = true, -2f, 2f)
+                lineTo(6.5f, 19.5f)
+                arcToRelative(2f, 2f, 0f, isMoreThanHalf = false, isPositiveArc = true, -2f, -2f)
+                lineTo(4.5f, 15.5f)
+                arcToRelative(2f, 2f, 0f, isMoreThanHalf = false, isPositiveArc = true, 2f, -2f)
+                close()
+
+                // Bottom-right
+                moveTo(15.5f, 13.5f)
+                lineTo(17.5f, 13.5f)
+                arcToRelative(2f, 2f, 0f, isMoreThanHalf = false, isPositiveArc = true, 2f, 2f)
+                lineTo(19.5f, 17.5f)
+                arcToRelative(2f, 2f, 0f, isMoreThanHalf = false, isPositiveArc = true, -2f, 2f)
+                lineTo(15.5f, 19.5f)
+                arcToRelative(2f, 2f, 0f, isMoreThanHalf = false, isPositiveArc = true, -2f, -2f)
+                lineTo(13.5f, 15.5f)
+                arcToRelative(2f, 2f, 0f, isMoreThanHalf = false, isPositiveArc = true, 2f, -2f)
+                close()
+            }
+        }.build()
+    }
+
+    /** List view icon (horizontal rows) for switching layout to list view. */
+    val ListView: ImageVector by lazy {
+        ImageVector.Builder(
+            name = "bc_list_view",
+            defaultWidth = 24.dp, defaultHeight = 24.dp,
+            viewportWidth = 24f, viewportHeight = 24f,
+        ).apply {
+            path(
+                stroke = stroke,
+                strokeLineWidth = STROKE,
+                strokeLineCap = StrokeCap.Round,
+                strokeLineJoin = StrokeJoin.Round,
+            ) {
+                // Three horizontal lines with bullet markers
+                moveTo(4.5f, 6.5f); lineTo(5.5f, 6.5f)
+                moveTo(9.5f, 6.5f); lineTo(19.5f, 6.5f)
+
+                moveTo(4.5f, 12f); lineTo(5.5f, 12f)
+                moveTo(9.5f, 12f); lineTo(19.5f, 12f)
+
+                moveTo(4.5f, 17.5f); lineTo(5.5f, 17.5f)
+                moveTo(9.5f, 17.5f); lineTo(19.5f, 17.5f)
             }
         }.build()
     }

@@ -3,17 +3,27 @@ package com.music.bitchord.playback
 import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
+import android.media.AudioDeviceCallback
+import android.media.AudioDeviceInfo
+import android.media.AudioFormat
+import android.media.AudioManager
 import android.net.Uri
+import android.os.Bundle
 import android.os.SystemClock
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import android.util.Log
 import androidx.media3.common.AudioAttributes
 import androidx.media3.common.C
 import androidx.media3.common.ForwardingPlayer
 import androidx.media3.common.Format
 import androidx.media3.common.MediaItem
+import androidx.media3.common.MimeTypes
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
 import androidx.media3.common.Timeline
+import androidx.core.net.toUri
+import androidx.media3.common.MediaMetadata
 import androidx.media3.common.audio.SonicAudioProcessor
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.datasource.DefaultDataSource
@@ -27,28 +37,64 @@ import androidx.media3.exoplayer.analytics.AnalyticsListener
 import androidx.media3.exoplayer.audio.AudioSink
 import androidx.media3.exoplayer.audio.DefaultAudioSink
 import androidx.media3.exoplayer.audio.SilenceSkippingAudioProcessor
+import androidx.media3.exoplayer.mediacodec.MediaCodecSelector
+import androidx.media3.exoplayer.mediacodec.MediaCodecUtil
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
+import androidx.media3.exoplayer.upstream.DefaultLoadErrorHandlingPolicy
+import androidx.media3.exoplayer.upstream.LoadErrorHandlingPolicy
+import androidx.media3.session.CommandButton
 import androidx.media3.session.DefaultMediaNotificationProvider
+import androidx.media3.session.LibraryResult
+import androidx.media3.session.MediaLibraryService
+import androidx.media3.session.MediaLibraryService.MediaLibrarySession
+import androidx.media3.session.MediaLibraryService.LibraryParams
 import androidx.media3.session.MediaSession
 import androidx.media3.session.MediaSessionService
+import androidx.media3.session.SessionCommand
+import androidx.media3.session.SessionError
+import androidx.media3.session.SessionResult
+import com.google.common.collect.ImmutableList
+import com.google.common.util.concurrent.Futures
+import com.google.common.util.concurrent.ListenableFuture
+import kotlinx.coroutines.guava.future
 import com.music.bitchord.MainActivity
 import com.music.bitchord.R
+import com.music.bitchord.data.LocalMediaRepository
+import com.music.bitchord.data.YtMusicRepository
+import com.music.bitchord.data.lyrics.EmbeddedLyrics
+import com.music.bitchord.data.lyrics.LyricLine
+import com.music.bitchord.data.lyrics.LyricsRepository
+import com.music.bitchord.data.model.NOTIFICATION_ART_PX
+import com.music.bitchord.data.model.SearchFilter
+import com.music.bitchord.data.model.SearchResult
+import com.music.bitchord.data.model.ShelfItem
+import com.music.bitchord.data.model.artworkAt
+import com.music.bitchord.download.Downloads
+import java.util.concurrent.ConcurrentHashMap
 import com.music.bitchord.data.Http
+import com.music.bitchord.data.LikeState
 import com.music.bitchord.data.NerdStats
 import com.music.bitchord.data.TrackLog
 import com.music.bitchord.data.discord.DiscordRPC
 import com.music.bitchord.data.innertube.PlaybackTracker
+import com.music.bitchord.data.stats.ListeningRecorder
 import com.music.bitchord.data.innertube.PlayerClient
 import com.music.bitchord.data.innertube.StreamResolver
+import com.music.bitchord.data.model.LikeStatus
 import com.music.bitchord.data.model.Song
 import com.music.bitchord.data.scrobbling.LastFM
 import com.music.bitchord.data.scrobbling.ListenBrainzManager
 import com.music.bitchord.data.scrobbling.ScrobbleManager
 import com.music.bitchord.data.settings.AppSettings
+import com.music.bitchord.data.settings.OutputPcmMode
 import com.music.bitchord.data.sources.SourceResolver
 import com.music.bitchord.data.sources.SourceStream
 import com.music.bitchord.data.sources.StreamFormat
 import com.music.bitchord.data.sources.TrackMatcher
+import com.music.bitchord.playback.smart.AutomixAnalysisSource
+import com.music.bitchord.widget.MediaWidget
+import com.music.bitchord.widget.MediaWidgetSnapshot
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -70,12 +116,26 @@ import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlin.math.abs
 import kotlinx.coroutines.TimeoutCancellationException
+import java.util.Locale
 
 /** Past this point in a track, back restarts it instead of skipping to the previous one. */
 const val BACK_RESTARTS_AFTER_MS = 10_000L
 
+/** Session command used by both the player UI and the media notification. */
+const val ACTION_TOGGLE_AUTOPLAY = "com.music.bitchord.action.TOGGLE_AUTOPLAY"
+
+/** Session command used by the media notification's Shuffle button. */
+const val ACTION_TOGGLE_SHUFFLE = "com.music.bitchord.action.TOGGLE_SHUFFLE"
+
+/** Session commands bracketing an explicit radio queue replacement. */
+const val ACTION_BEGIN_RADIO_QUEUE = "com.music.bitchord.action.BEGIN_RADIO_QUEUE"
+const val ACTION_COMMIT_RADIO_QUEUE = "com.music.bitchord.action.COMMIT_RADIO_QUEUE"
+
+/** Session command behind the player menu's "Upgrade quality". */
+const val ACTION_UPGRADE_QUALITY = "com.music.bitchord.action.UPGRADE_QUALITY"
+
 /**
- * Background playback via Media3. A [MediaSessionService] gives us the media
+ * Background playback via Media3. A [MediaLibraryService] gives us the media
  * notification, lockscreen/Bluetooth controls, and Android Auto surface for
  * free; UI processes attach with a MediaController.
  *
@@ -88,9 +148,131 @@ const val BACK_RESTARTS_AFTER_MS = 10_000L
  * whole life; [CrossfadeController] rides on top of it as volume automation.
  */
 @UnstableApi
-class PlaybackService : MediaSessionService() {
+class PlaybackService : MediaLibraryService() {
 
-    private var mediaSession: MediaSession? = null
+    private var mediaSession: MediaLibrarySession? = null
+    private val searchResults = ConcurrentHashMap<String, List<Song>>()
+    private val songCache = ConcurrentHashMap<String, Song>()
+
+    /**
+     * [YtMusicRepository.home] cached briefly for Android Auto's browse tree.
+     *
+     * Recents and Quick Picks each read the same home feed, and Auto re-runs
+     * `onGetChildren` every time either folder is opened — including just
+     * backing out and back in. Without this, one glance at Quick Picks after
+     * Recents paid for the full three-way home fetch twice in a row, which is
+     * most of what read as lag browsing the car UI. The window is short
+     * enough that a pull-to-refresh-style wait for genuinely new content
+     * never has to wait this long for it.
+     */
+    /**
+     * [YtMusicRepository.recents] cached for Android Auto's browse tree.
+     */
+    private var cachedRecents: Pair<Long, List<Song>>? = null
+    private val recentsMutex = Mutex()
+    private val RECENTS_CACHE_TTL_MS = 30_000L
+
+    private suspend fun cachedRecentsSongs(): List<Song> = recentsMutex.withLock {
+        cachedRecents?.let { (at, songs) ->
+            if (SystemClock.elapsedRealtime() - at < RECENTS_CACHE_TTL_MS && songs.isNotEmpty()) return songs
+        }
+        val songs = try {
+            withTimeoutOrNull(4000L) {
+                YtMusicRepository.recents().getOrNull()
+            } ?: emptyList()
+        } catch (_: Exception) {
+            emptyList()
+        }
+        if (songs.isNotEmpty()) {
+            cachedRecents = SystemClock.elapsedRealtime() to songs
+            songs.forEach { songCache[it.videoId] = it }
+        }
+        songs
+    }
+
+    /**
+     * [YtMusicRepository.quickPicks] cached for Android Auto's browse tree.
+     * Excludes listening history songs to guarantee strictly unique data.
+     */
+    private var cachedQuickPicks: Pair<Long, List<Song>>? = null
+    private val quickPicksMutex = Mutex()
+    private val QUICK_PICKS_CACHE_TTL_MS = 60_000L
+
+    private suspend fun cachedQuickPicksSongs(): List<Song> = quickPicksMutex.withLock {
+        cachedQuickPicks?.let { (at, songs) ->
+            if (SystemClock.elapsedRealtime() - at < QUICK_PICKS_CACHE_TTL_MS && songs.isNotEmpty()) return songs
+        }
+        val recentsIds = cachedRecents?.second?.mapTo(HashSet()) { it.videoId } ?: emptySet()
+        val songs = try {
+            withTimeoutOrNull(4000L) {
+                YtMusicRepository.quickPicks(excludeSongIds = recentsIds).getOrNull()
+            } ?: emptyList()
+        } catch (_: Exception) {
+            emptyList()
+        }
+        if (songs.isNotEmpty()) {
+            cachedQuickPicks = SystemClock.elapsedRealtime() to songs
+            songs.forEach { songCache[it.videoId] = it }
+        }
+        songs
+    }
+
+    /**
+     * [YtMusicRepository.browseSongs] for Liked Music cached for Android Auto's browse tree.
+     */
+    private var cachedLiked: Pair<Long, List<Song>>? = null
+    private val likedMutex = Mutex()
+    private val LIKED_CACHE_TTL_MS = 60_000L
+
+    private suspend fun cachedLikedSongs(): List<Song> = likedMutex.withLock {
+        if (com.music.bitchord.data.innertube.Innertube.cookie == null) return emptyList()
+        cachedLiked?.let { (at, songs) ->
+            if (SystemClock.elapsedRealtime() - at < LIKED_CACHE_TTL_MS && songs.isNotEmpty()) return songs
+        }
+        val songs = try {
+            withTimeoutOrNull(4000L) {
+                YtMusicRepository.browseSongs(YtMusicRepository.LIKED_MUSIC).getOrNull()?.songs?.ifEmpty { null }
+                    ?: YtMusicRepository.browseSongs("LM").getOrNull()?.songs?.ifEmpty { null }
+                    ?: run {
+                        val libPlaylists = YtMusicRepository.libraryPlaylists().getOrNull()
+                        val likedCard = libPlaylists?.firstOrNull {
+                            it.browseId == "VLLM" || it.title.contains("liked", ignoreCase = true)
+                        }
+                        if (likedCard?.browseId != null) {
+                            YtMusicRepository.browseSongs(likedCard.browseId).getOrNull()?.songs
+                        } else null
+                    }
+                    ?: YtMusicRepository.browseSongs("FEmusic_liked_videos").getOrNull()?.songs
+            } ?: emptyList()
+        } catch (_: Exception) {
+            emptyList()
+        }
+        if (songs.isNotEmpty()) {
+            cachedLiked = SystemClock.elapsedRealtime() to songs
+            songs.forEach { songCache[it.videoId] = it }
+            LikeState.seedLiked(songs.mapTo(HashSet()) { it.videoId })
+        }
+        songs
+    }
+
+    private var cachedHome: Pair<Long, com.music.bitchord.data.model.HomeFeed>? = null
+    private val homeMutex = Mutex()
+    private val HOME_CACHE_TTL_MS = 60_000L
+
+    private suspend fun cachedHomeFeed(): com.music.bitchord.data.model.HomeFeed? = homeMutex.withLock {
+        cachedHome?.let { (at, feed) ->
+            if (SystemClock.elapsedRealtime() - at < HOME_CACHE_TTL_MS) return feed
+        }
+        val feed = YtMusicRepository.home().getOrNull() ?: return null
+        cachedHome = SystemClock.elapsedRealtime() to feed
+        feed
+    }
+
+    private val audioManager by lazy { getSystemService(AudioManager::class.java) }
+    private val outputDeviceCallback = object : AudioDeviceCallback() {
+        override fun onAudioDevicesAdded(addedDevices: Array<AudioDeviceInfo>) = requestOutputReconfiguration()
+        override fun onAudioDevicesRemoved(removedDevices: Array<AudioDeviceInfo>) = requestOutputReconfiguration()
+    }
 
     /**
      * The player the session is on. Swaps with [spare] at every crossfade — see
@@ -107,6 +289,8 @@ class PlaybackService : MediaSessionService() {
     private var spare: ExoPlayer? = null
 
     private var crossfade: CrossfadeController? = null
+    private var configuredFloatOutput = false
+    private var outputReconfigureJob: Job? = null
 
     /**
      * One audio-processor set per player, because both carry per-sink state — a
@@ -120,6 +304,14 @@ class PlaybackService : MediaSessionService() {
     private val spatialAudioProcessorB = SpatialAudioProcessor()
     private val transitionFilterA = TransitionFilterProcessor()
     private val transitionFilterB = TransitionFilterProcessor()
+
+    /**
+     * Whether the format currently arriving at the active player's decoder
+     * is Dolby Atmos (E-AC-3 JOC). Widening a JOC stream would fight the
+     * object-based mix Dolby already spatializes, so the effect is forced
+     * off for as long as this is true — see [applySpatialAudioEnabled].
+     */
+    private var activeTrackIsDolbyAtmos = false
 
     private var activeFilter: TransitionFilterProcessor = transitionFilterA
     private var spareFilter: TransitionFilterProcessor = transitionFilterB
@@ -135,6 +327,32 @@ class PlaybackService : MediaSessionService() {
 
     /** When the current track was chosen, for the time-to-first-audio log. */
     private var trackSelectedAt: Long? = null
+
+    /**
+     * The last track that actually made a sound, which is how [recoverFrom]
+     * tells "this never started" from "this died in the middle".
+     *
+     * Deliberately a mediaId rather than a flag that gets cleared on every
+     * transition. A retry *is* a seek, so a transition fires for it — the same
+     * trap [recoveries] fell into — and a flag cleared there would make a track
+     * that failed twenty seconds in look like a track that never began, which is
+     * precisely the case that must not be skipped past. Holding the id instead
+     * means the queue moving to a different track invalidates it for free, and
+     * nothing has to be cleared anywhere.
+     *
+     * The one thing it is deliberately wrong about: a track played earlier in
+     * the session and returned to — by repeat-one, by the previous button —
+     * still counts as audible, so a later failure to start it is only retried
+     * and not skipped. That errs towards leaving the listener where they are,
+     * which is the safe direction for a queue.
+     */
+    private var audibleMediaId: String? = null
+
+    /**
+     * How many tracks in a row have been skipped for a plain playback error,
+     * reset the moment anything actually plays — see [MAX_CONSECUTIVE_SKIPS].
+     */
+    private var consecutiveErrorSkips = 0
 
     private var scrobbleManager: ScrobbleManager? = null
     private var listenBrainzSong: Song? = null
@@ -170,6 +388,65 @@ class PlaybackService : MediaSessionService() {
 
     private val scope = CoroutineScope(Dispatchers.Main + SupervisorJob())
 
+    /** Commands exposed as the secondary buttons on the media notification. */
+    private val favoriteCommand = SessionCommand(ACTION_TOGGLE_FAVORITE, Bundle.EMPTY)
+    private val autoplayCommand = SessionCommand(ACTION_TOGGLE_AUTOPLAY, Bundle.EMPTY)
+    private val shuffleCommand = SessionCommand(ACTION_TOGGLE_SHUFFLE, Bundle.EMPTY)
+    private val beginRadioQueueCommand = SessionCommand(ACTION_BEGIN_RADIO_QUEUE, Bundle.EMPTY)
+    private val commitRadioQueueCommand = SessionCommand(ACTION_COMMIT_RADIO_QUEUE, Bundle.EMPTY)
+    private val upgradeQualityCommand = SessionCommand(ACTION_UPGRADE_QUALITY, Bundle.EMPTY)
+
+    private var favoriteActionJob: Job? = null
+    private var autoplayLoadJob: Job? = null
+    private var autoplaySeed: String? = null
+
+    /** Index in the live queue represented by entry zero of the persisted window. */
+    private var persistedQueueStart = 0
+
+    /**
+     * What AutoPlay had queued when repeat-all was switched on, held so
+     * switching it off again puts back the same tracks rather than a fresh
+     * mix.
+     *
+     * Repeat-all loops the queue as it stands, so AutoPlay's endless supply of
+     * new tracks comes out of it first — see [onRepeatModeChanged]. Fetching a
+     * replacement mix afterwards is the obvious thing to do and the wrong one:
+     * the track that was queued next has usually been analysed for the
+     * transition into it by then (see
+     * [com.music.bitchord.playback.smart.TrackAnalyzer]), and a different track
+     * in its place means that several-second decode is spent again, on a song
+     * that is now much closer than it was. Turning repeat on and back off
+     * should leave the queue where it found it.
+     */
+    private var repeatAllStash: List<MediaItem> = emptyList()
+
+    /**
+     * The track that was playing when [repeatAllStash] was taken. The stash
+     * describes what came after *that* track, so it is only put back if the
+     * queue has not moved on in the meantime.
+     */
+    private var repeatAllStashSeed: String? = null
+
+    /**
+     * The last repeat mode seen, so [onRepeatModeChanged] can tell which
+     * direction the change went in: the callback reports where the player has
+     * arrived, and leaving repeat-all is the half that has to restore.
+     */
+    private var lastRepeatMode = Player.REPEAT_MODE_OFF
+
+    /**
+     * Every song AutoPlay has offered or played this service instance, kept
+     * only so "don't repeat suggestions" has something to check against once
+     * a song scrolls out of the live queue or the queue itself is replaced.
+     * Never persisted — a fresh process means a fresh session.
+     */
+    private val sessionSongHistory = mutableListOf<Song>()
+
+    private var serviceLyricsJob: Job? = null
+    private var serviceLyrics: List<LyricLine>? = null
+    private var lastPublishedSubtitle: String? = null
+    private var lyricsTickerJob: Job? = null
+
     /**
      * Everything the service books against the player it is currently on.
      *
@@ -199,25 +476,42 @@ class PlaybackService : MediaSessionService() {
                     )
                     trackSelectedAt = null
                 }
+                // Sound is out of the speaker, so whatever happens to this track
+                // from here is a failure mid-song. Also the one thing that can
+                // say the queue is not simply unplayable end to end.
+                audibleMediaId = exoPlayer.currentMediaItem?.mediaId
+                consecutiveErrorSkips = 0
             }
             if (isPlaying) registerCurrentPlay()
             // Nothing to read ahead for while paused, and a pause is often
             // the last thing that happens before the process goes idle.
             if (isPlaying) prefetchAround(exoPlayer) else AudioCache.cancel()
             if (isPlaying) lookForBetterCopy(exoPlayer)
-            saveQueue()
+            savePlaybackState(exoPlayer)
+            // Not strictly needed for the glyph — onPlayWhenReadyChanged has
+            // already flipped that — but this is where hasNext/hasPrevious and
+            // the artwork are known to be settled.
+            publishWidgetState()
 
             val song = exoPlayer.currentMediaItem?.toSong()
             val durationMs = exoPlayer.duration.takeIf { it > 0 }
             scrobbleManager?.onPlayerStateChanged(isPlaying, song, durationMs)
 
+            // The listening record has to be told a pause happened, not merely
+            // stop being told about play: its sampler measures the gap between
+            // ticks, and an unclosed one across a pause is an afternoon on the
+            // lock screen arriving as an afternoon of listening.
+            if (!isPlaying) ListeningRecorder.onStopped()
+
             // ListenBrainz: "now playing" on play/resume too, not just on
             // transition — a track started from idle or resumed from pause
             // otherwise stays silent on the site.
             if (isPlaying && song != null) {
-                if (listenBrainzSong == null) {
+                if (listenBrainzSong?.videoId != song.videoId || listenBrainzStartMs == 0L) {
                     listenBrainzSong = song
                     listenBrainzStartMs = System.currentTimeMillis()
+                    listenBrainzDurationMs = durationMs
+                } else if (listenBrainzDurationMs == null) {
                     listenBrainzDurationMs = durationMs
                 }
                 submitListenBrainzPlayingNow(song, exoPlayer.currentPosition, durationMs)
@@ -229,9 +523,26 @@ class PlaybackService : MediaSessionService() {
             // on advancing through a song that has stopped — and finishes it.
             if (isPlaying) {
                 pushDiscordPresence(exoPlayer)
+                startLyricsTicker()
             } else {
                 clearDiscordPresence()
+                stopLyricsTicker()
             }
+        }
+
+        /**
+         * The one callback the home-screen widget can be driven from.
+         *
+         * `onIsPlayingChanged` is too late by seconds: this app resolves a
+         * stream before it can buffer one, and for a YouTube track that means a
+         * NewPipe extraction, all of which happens with `isPlaying` still false.
+         * A widget keyed on that answers a tap on play by leaving the play glyph
+         * exactly where it was — the control reads as broken, and the obvious
+         * response is to tap it again. `playWhenReady` flips on the command, not
+         * on the audio, which is what the media notification shows too.
+         */
+        override fun onPlayWhenReadyChanged(playWhenReady: Boolean, reason: Int) {
+            publishWidgetState(playing = playWhenReady)
         }
 
         /**
@@ -247,8 +558,9 @@ class PlaybackService : MediaSessionService() {
             reason: Int,
         ) {
             val exoPlayer = player ?: return
-            if (reason == Player.DISCONTINUITY_REASON_SEEK && exoPlayer.isPlaying) {
-                pushDiscordPresence(exoPlayer)
+            if (reason == Player.DISCONTINUITY_REASON_SEEK) {
+                if (exoPlayer.isPlaying) pushDiscordPresence(exoPlayer)
+                updateLyricSubtitle()
             }
         }
 
@@ -284,6 +596,13 @@ class PlaybackService : MediaSessionService() {
                     reason == Player.MEDIA_ITEM_TRANSITION_REASON_REPEAT,
                 reason = reason,
             )
+            autoplayLoadJob?.cancel()
+            autoplayLoadJob = null
+            autoplaySeed = null
+            loadAutoplayForCurrentTrack()
+            loadLyricsForCurrentTrack()
+            if (exoPlayer.isPlaying) startLyricsTicker()
+            mediaSession?.setCustomLayout(notificationButtons())
         }
 
         /**
@@ -309,17 +628,50 @@ class PlaybackService : MediaSessionService() {
             val exoPlayer = player ?: return
             if (state == Player.STATE_ENDED) {
                 SleepTimer.cancel()
+                // The queue ran dry, so no transition will ever close the last
+                // track out. Without this its history entry keeps whatever
+                // watchtime the 30-second sampler happened to have reported and
+                // is never marked finished — so the one play most likely to be
+                // a full, deliberate listen is the one recorded as abandoned.
+                PlaybackTracker.onPlaybackFinished(lastPositionSeconds)
+                lastPositionSeconds = 0
                 // The last track finished with nothing after it, so no
                 // transition will ever close it out. Scrobble it now.
                 val lastSong = listenBrainzSong
-                if (lastSong != null) {
+                if (lastSong != null && listenBrainzStartMs > 0L) {
                     val lastStart = listenBrainzStartMs
                     val lastDuration = listenBrainzDurationMs
                         ?: exoPlayer.duration.takeIf { it > 0 }
                     submitListenBrainzFinished(lastSong, lastStart, lastDuration)
-                    listenBrainzSong = null
                 }
+                listenBrainzSong = null
+                listenBrainzStartMs = 0L
+                listenBrainzDurationMs = null
             }
+        }
+
+        override fun onRepeatModeChanged(repeatMode: Int) {
+            val previous = lastRepeatMode
+            lastRepeatMode = repeatMode
+            // Repeat-all loops the queue as it stands; AutoPlay's tracks are the
+            // opposite of that — an endless supply of new ones — so they come
+            // back out first, and native REPEAT_MODE_ALL then wraps a plain
+            // queue exactly as it should. [loadAutoplayForCurrentTrack] leaves
+            // it alone for as long as repeat-all stays on.
+            //
+            // Done here rather than in the UI that used to do it because this is
+            // the only place that sees the *previous* mode, and taking the
+            // tracks back is only half the job: they have to go in again when
+            // the loop ends, or a listener who cycles repeat on and straight
+            // back off is left with a queue that simply stops after the playing
+            // track.
+            when {
+                repeatMode == Player.REPEAT_MODE_ALL -> stashAutoplayTracks()
+                previous == Player.REPEAT_MODE_ALL -> restoreAutoplayTracks()
+            }
+            // Turning repeat-all back off can leave the current item at the end
+            // of the queue, which is the same trigger as a normal transition.
+            loadAutoplayForCurrentTrack()
         }
 
         /**
@@ -332,6 +684,10 @@ class PlaybackService : MediaSessionService() {
             // session is currently pointed at.
             val exoPlayer = player ?: return
             if (exoPlayer.isPlaying) prefetchAround(exoPlayer)
+            if (reason == Player.TIMELINE_CHANGE_REASON_PLAYLIST_CHANGED) {
+                saveQueueSnapshot(exoPlayer)
+                mediaSession?.setCustomLayout(notificationButtons())
+            }
         }
     }
 
@@ -351,16 +707,20 @@ class PlaybackService : MediaSessionService() {
             // the app's caching/upgrade logic in between, so it's the one
             // line that can prove a "hi-res" session never quietly slid
             // onto a lower-rate stream mid-track. `adb logcat -s DECODE:I`.
-            val khz = format.sampleRate.takeIf { it != Format.NO_VALUE }
-                ?.let { "%.1fkHz".format(it / 1000.0) } ?: "?kHz"
-            val kbps = format.bitrate.takeIf { it != Format.NO_VALUE }
+            val measured = format.measure()
+            val khz = measured.sampleRateHz
+                ?.let { "%.1fkHz".format(Locale.ROOT, it / 1000.0) } ?: "?kHz"
+            val kbps = format.bitrate.takeIf { it > 0 }
                 ?.let { "${it / 1000}kbps" } ?: "bitrate n/a"
-            val depth = bitDepthOf(format.pcmEncoding)?.let { "${it}-bit" } ?: "?-bit"
+            val depth = measured.bitDepth?.let { "${it}-bit" } ?: "?-bit"
+            val channels = measured.channels?.let { "${it}ch" } ?: "?ch"
             TrackLog.i(
                 "DECODE",
-                "$audioFormatFor <- ${format.sampleMimeType} $khz $kbps $depth ${format.channelCount}ch",
+                "$audioFormatFor <- ${format.sampleMimeType} $khz $kbps $depth $channels",
                 about = audioFormatFor,
             )
+            activeTrackIsDolbyAtmos = NerdStats.isDolbyAtmosMime(format.sampleMimeType)
+            applySpatialAudioEnabled()
             publishNerdStats()
         }
 
@@ -409,6 +769,11 @@ class PlaybackService : MediaSessionService() {
             initializedTimestampMs: Long,
             initializationDurationMs: Long,
         ) {
+            TrackLog.i(
+                "AUDIO_OUT",
+                "decoder=$decoderName initialized in ${initializationDurationMs}ms",
+                about = eventTime.mediaId(),
+            )
             val cutAt = swapCutAt ?: return
             TrackLog.d(
                 "BitChord",
@@ -417,6 +782,22 @@ class PlaybackService : MediaSessionService() {
                 about = eventTime.mediaId(),
             )
         }
+
+        override fun onAudioTrackInitialized(
+            eventTime: AnalyticsListener.EventTime,
+            audioTrackConfig: AudioSink.AudioTrackConfig,
+        ) {
+            AudioOutputStatus.publishAudioTrack(
+                encoding = audioTrackConfig.encoding,
+                sampleRateHz = audioTrackConfig.sampleRate,
+            )
+            TrackLog.i(
+                "AUDIO_OUT",
+                "AudioTrack ${audioTrackConfig.sampleRate}Hz encoding=${audioTrackConfig.encoding}",
+                about = eventTime.mediaId(),
+            )
+        }
+
     }
 
     /**
@@ -435,6 +816,10 @@ class PlaybackService : MediaSessionService() {
 
     override fun onCreate() {
         super.onCreate()
+
+        if (com.music.bitchord.data.innertube.Innertube.cookie == null) {
+            com.music.bitchord.data.innertube.Innertube.cookie = com.music.bitchord.auth.AuthStore(this).cookie
+        }
 
         // First, because everything below assumes it is standing up fresh and
         // one of the two ways this service starts does not give it that.
@@ -460,17 +845,22 @@ class PlaybackService : MediaSessionService() {
                 .apply { setSmallIcon(R.drawable.ic_notification_logo) },
         )
 
-        // No user agent on the factory: the right one depends on which client
-        // minted the URL, so it is set per request below. Setting it here as
-        // well would not override that — OkHttpDataSource *appends* the
-        // factory's agent after the request's, and the fetch would go out
-        // carrying two contradictory User-Agent headers.
-        val resolvingFactory = ResolvingDataSource.Factory(
-            // Innermost, so it chunks the real googlevideo URL the resolver
-            // below has already substituted in — see [ChunkedDataSource] for
-            // why an open-ended read of one is worth avoiding.
-            ChunkedDataSource.Factory(OkHttpDataSource.Factory(Http.client), STREAM_CHUNK_BYTES),
-        ) { dataSpec ->
+        // The player screen toggles QueueShuffle directly on its MediaController.
+        // Observe the shared state here so the notification's Shuffle icon and
+        // label follow that toggle immediately as well.
+        scope.launch {
+            QueueShuffle.enabled
+                .collectLatest {
+                    mediaSession?.setCustomLayout(notificationButtons())
+                }
+        }
+        scope.launch {
+            LikeState.overrides.collectLatest {
+                mediaSession?.setCustomLayout(notificationButtons())
+            }
+        }
+
+        val streamResolver = ResolvingDataSource.Resolver { dataSpec ->
             // Which track everything below is for, said once, because none of
             // it would otherwise know: this runs on ExoPlayer's loader thread
             // with a DataSpec and nothing else, and the work it starts — the
@@ -490,13 +880,55 @@ class PlaybackService : MediaSessionService() {
                     withTimeout(RESOLVE_TIMEOUT_MS) { SourceResolver.resolve(dataSpec.uri) }
                 } ?: throw java.io.IOException("No enabled source could serve ${dataSpec.uri.getQueryParameter("n")}")
                 NerdStats.onSourceStream(dataSpec.uri.getQueryParameter("t"), stream.format)
-                return@Factory dataSpec.buildUpon()
+                return@Resolver dataSpec.buildUpon()
                     .setUri(Uri.parse(stream.url))
                     .setHttpRequestHeaders(stream.headers)
                     .build()
             }
             val videoId = dataSpec.uri.getQueryParameter("v")
-                ?: return@Factory dataSpec
+                ?: return@Resolver dataSpec
+            // An explicit rollback is not a preference for a different
+            // candidate: it means this exact YouTube rendition, immediately.
+            // Answer it before StreamChoice, the module race and a pending
+            // upgrade can put another source back under the listener.
+            if (dataSpec.uri.getQueryParameter(DIRECT_YOUTUBE_PARAMETER) == "1") {
+                QualityUpgrade.forget(videoId)
+                StreamChoice.forget(videoId)
+                NerdStats.clearDeclared(videoId)
+                val streamUrl = try {
+                    runBlocking(about) {
+                        withTimeout(RESOLVE_TIMEOUT_MS) { StreamResolver.resolve(videoId) }
+                    }
+                } catch (e: TimeoutCancellationException) {
+                    throw java.io.IOException("Direct YouTube resolution timed out for $videoId", e)
+                }
+                val headers = PlayerClient.forStreamUrl(streamUrl).mediaHeaders()
+                TrackLog.d("BitChord", "serving original YouTube version for $videoId", about = videoId)
+                return@Resolver dataSpec.buildUpon()
+                    .setUri(Uri.parse(streamUrl))
+                    .setHttpRequestHeaders(headers)
+                    .build()
+            }
+            // Automix owns a base-cache Opus rendition. It must bypass the
+            // playback race winner (JioSaavn, a module, or a lossless upgrade)
+            // and resolve directly to YouTube for this analysis-only request.
+            if (AutomixAnalysisSource.requestsYouTubeOpus(
+                    dataSpec.uri.getQueryParameter(AutomixAnalysisSource.OPUS_QUERY_PARAMETER),
+                )
+            ) {
+                val streamUrl = try {
+                    runBlocking(about) {
+                        withTimeout(RESOLVE_TIMEOUT_MS) { StreamResolver.resolve(videoId) }
+                    }
+                } catch (e: TimeoutCancellationException) {
+                    throw java.io.IOException("Automix Opus resolution timed out for $videoId", e)
+                }
+                val headers = PlayerClient.forStreamUrl(streamUrl).mediaHeaders()
+                return@Resolver dataSpec.buildUpon()
+                    .setUri(Uri.parse(streamUrl))
+                    .setHttpRequestHeaders(headers)
+                    .build()
+            }
             // An upgraded item carries a marker and its stream has already
             // been found — see [QualityUpgrade]. Answered before anything
             // else, and without re-resolving: this exact URL is what the
@@ -521,15 +953,19 @@ class PlaybackService : MediaSessionService() {
                         "at ${dataSpec.position} (${upgraded.format.summary})",
                     about = videoId,
                 )
-                return@Factory dataSpec.buildUpon()
+                return@Resolver dataSpec.buildUpon()
                     .setUri(Uri.parse(upgraded.url))
                     .setHttpRequestHeaders(upgraded.headers)
                     .build()
             }
-            val downloadedUri = runBlocking(about) { com.music.bitchord.download.Downloads.savedUri(this@PlaybackService, videoId) }
-            if (downloadedUri != null) {
-                return@Factory dataSpec.buildUpon().setUri(downloadedUri).build()
-            }
+            // A downloaded copy is *not* substituted here, deliberately. This
+            // point is inside the HTTP-only half of the chain — below
+            // DefaultDataSource, which has already given up on dispatching by
+            // scheme, and below the cache bypass that keeps local files from
+            // being written to disk a second time. A content:// URI returned
+            // from here reaches OkHttp, which refuses it as a malformed URL.
+            // Which copy of a track to play is settled where the item is built
+            // instead: see [Song.toMediaItem].
             // Whoever is already filling this track's cache entry keeps it.
             // Everything below decides between servers holding *different
             // files*, and this method is called again for every re-open of a
@@ -538,7 +974,48 @@ class PlaybackService : MediaSessionService() {
             // the middle of an MP4 ended up appended to a WebM. See
             // [StreamChoice].
             StreamChoice.of(videoId)?.let { serving ->
-                return@Factory dataSpec.buildUpon()
+                // What the stream claims to be, restated on every open rather
+                // than only on the one that chose it.
+                //
+                // The race below is what used to report this, and it was enough
+                // while the race was the only way a substitution could be made.
+                // Read-ahead now pins one before the track is reached, so a
+                // warmed track arrives *here* on its very first open and never
+                // reaches the race at all — leaving the player with a 320kbps
+                // stream and nothing on record saying so, and the quality badge
+                // reading blank until the decoder got far enough to measure it
+                // for itself.
+                //
+                // Only when the format states something. A plain YouTube choice
+                // is remembered with an empty one, and writing that over a
+                // claim some other path made would be worse than saying nothing.
+                if (serving.format != StreamFormat()) {
+                    NerdStats.onSourceStream(videoId, serving.format)
+                }
+                // Read-ahead can pin JioSaavn's quick 320kbps answer before
+                // this track becomes current.  It is the right answer for an
+                // immediate start, but it is not the final quality verdict:
+                // returning here used to bypass [resolveWithModulePriority],
+                // the only path which calls [QualityUpgrade.settledForLess].
+                // Consequently a warmed track displayed its high-quality
+                // source but never kept the upgrading state or asked the
+                // module for its lossless copy.
+                //
+                // Only substituted, non-lossless choices need this. A pinned
+                // YouTube URL has no source result to promote, and a lossless
+                // module result already satisfies the request.
+                if (StreamChoice.isSubstitute(videoId) &&
+                    serving.format.isLossless != true &&
+                    QualityUpgrade.couldStillUpgrade(videoId, dataSpec.uri)
+                ) {
+                    val pending = QualityUpgrade.settledForLess(
+                        mediaId = videoId,
+                        target = SourceResolver.targetIn(dataSpec.uri),
+                        playing = serving.format,
+                    )
+                    if (!pending) NerdStats.onLosslessRaceEnd(videoId)
+                }
+                return@Resolver dataSpec.buildUpon()
                     .setUri(Uri.parse(serving.url))
                     .setHttpRequestHeaders(serving.headers)
                     .build()
@@ -567,7 +1044,7 @@ class PlaybackService : MediaSessionService() {
                 // above under a half-filled cache entry, and the entry would
                 // then be finished by a different file.
                 StreamChoice.remember(videoId, SourceStream(streamUrl, headers = headers), substituted = false)
-                return@Factory dataSpec.buildUpon()
+                return@Resolver dataSpec.buildUpon()
                     .setUri(Uri.parse(streamUrl))
                     .setHttpRequestHeaders(headers)
                     .build()
@@ -605,11 +1082,36 @@ class PlaybackService : MediaSessionService() {
                 }
             }
         }
+
+        // No user agent on the factory: the right one depends on which client
+        // minted the URL, so it is set per request below. Setting it here as
+        // well would not override that — OkHttpDataSource *appends* the
+        // factory's agent after the request's, and the fetch would go out
+        // carrying two contradictory User-Agent headers.
+        val resolvingFactory = ResolvingDataSource.Factory(
+            // Innermost, so it chunks the real googlevideo URL the resolver
+            // above has already substituted in — see [ChunkedDataSource] for
+            // why an open-ended read of one is worth avoiding.
+            ChunkedDataSource.Factory(OkHttpDataSource.Factory(Http.client), STREAM_CHUNK_BYTES),
+        ) { dataSpec ->
+            // Wrapped rather than folded into the resolver above so the record
+            // is made in one place for every branch of it, and made from what
+            // the resolver *returned* rather than from what each branch meant
+            // to return. Nothing above this line knows what is really on the
+            // end of a `bitchord://` URI and nothing below it knows which
+            // track's bytes it is fetching; this is the seam where both are in
+            // hand. See [StreamContainer].
+            streamResolver.resolveDataSpec(dataSpec).also { resolved ->
+                mediaIdIn(dataSpec.uri)?.let { StreamContainer.served(it, resolved.uri.toString()) }
+            }
+        }
         // Read-ahead resolves streams through the same chain the player does.
         val defaultDataSourceFactory = DefaultDataSource.Factory(this, resolvingFactory)
         AudioCache.setUpstream(defaultDataSourceFactory)
         mediaSourceFactory = DefaultMediaSourceFactory(AudioCache.playbackFactory(defaultDataSourceFactory))
+            .setLoadErrorHandlingPolicy(PermanentAwareLoadErrorPolicy())
 
+        configuredFloatOutput = shouldEnableFloatOutput()
         val exoPlayer = buildPlayer(spatialAudioProcessorA, transitionFilterA, ownsSession = true)
         val sparePlayer = buildPlayer(spatialAudioProcessorB, transitionFilterB, ownsSession = false)
         player = exoPlayer
@@ -619,6 +1121,8 @@ class PlaybackService : MediaSessionService() {
         // to be audible. Without it a crossfade would audibly change EQ halfway
         // through, and again at every handoff.
         sparePlayer.audioSessionId = exoPlayer.audioSessionId
+        audioManager?.registerAudioDeviceCallback(outputDeviceCallback, null)
+        applyOutputRoute()
 
         AppSettings.audioSessionId.value = exoPlayer.audioSessionId
         applySettings(exoPlayer)
@@ -627,13 +1131,17 @@ class PlaybackService : MediaSessionService() {
         observeScrobbling()
         observeDiscord()
         watchSleepTimer()
-        // Before the listener below is attached, so loading the queue doesn't
-        // read as a track change and set the read-ahead going.
-        restoreLastQueue(exoPlayer)
-
+        if (restoreLastQueue(exoPlayer)) {
+            publishWidgetState()
+        } else {
+            MediaWidgetSnapshot.save(this, MediaWidgetSnapshot.EMPTY)
+            MediaWidget.refresh(this)
+        }
         // History pings fire once a track is actually audible — both when
         // playback starts and when the queue moves on while already playing.
+        lastRepeatMode = exoPlayer.repeatMode
         exoPlayer.addListener(playbackListener)
+        loadAutoplayForCurrentTrack()
 
         // Only the analytics listener reports the format the audio renderer was
         // configured with. Treated as a trigger rather than a source: the
@@ -643,7 +1151,22 @@ class PlaybackService : MediaSessionService() {
 
         reportProgress()
 
-        val controller = CrossfadeController(
+        val controller = createCrossfadeController()
+        crossfade = controller
+        controller.start()
+
+        mediaSession = MediaLibrarySession.Builder(
+            this,
+            SessionPlayer(exoPlayer, controller) { lastPublishedSubtitle },
+            MediaLibraryCallback(),
+        )
+            .setId(SESSION_ID)
+            .setSessionActivity(sessionActivity())
+            .build()
+        mediaSession?.setCustomLayout(notificationButtons())
+    }
+
+    private fun createCrossfadeController() = CrossfadeController(
             scope,
             active = { requireNotNull(player) },
             standby = { requireNotNull(spare) },
@@ -668,13 +1191,197 @@ class PlaybackService : MediaSessionService() {
             },
             analysisRunningFor = { item -> trackAnalyzer.isAnalysing(item.mediaId) },
         )
-        crossfade = controller
-        controller.start()
 
-        mediaSession = MediaSession.Builder(this, SessionPlayer(exoPlayer, controller))
-            .setId(SESSION_ID)
-            .setSessionActivity(sessionActivity())
+    /**
+     * The one custom layout advertised to all Media3 control surfaces.
+     *
+     * AutoPlay is deliberately not here. It stays a player-screen control: the
+     * session command remains available so [toggleAutoplay] still routes through
+     * this service, it just isn't offered as a notification button.
+     */
+    private fun notificationButtons(): List<CommandButton> {
+        val favorite = CommandButton.Builder(
+            if (LikeState.overrides.value[player?.currentMediaItem?.mediaId] == LikeStatus.LIKE) {
+                CommandButton.ICON_HEART_FILLED
+            } else {
+                CommandButton.ICON_HEART_UNFILLED
+            },
+        )
+            .setSessionCommand(favoriteCommand)
+            .setDisplayName("Favorite")
             .build()
+        val shuffleEnabled = QueueShuffle.enabled.value
+        val shuffle = CommandButton.Builder(
+            if (shuffleEnabled) {
+                CommandButton.ICON_SHUFFLE_ON
+            } else {
+                CommandButton.ICON_SHUFFLE_OFF
+            },
+        )
+            .setSessionCommand(shuffleCommand)
+            .setDisplayName(if (shuffleEnabled) "Shuffle off" else "Shuffle on")
+            .build()
+        return listOf(favorite, shuffle)
+    }
+
+    private fun toggleShuffleFromNotification() {
+        player?.let(QueueShuffle::toggle)
+        mediaSession?.setCustomLayout(notificationButtons())
+    }
+
+    private fun toggleAutoplayFromNotification() {
+        val enabled = !AppSettings.autoplay.value
+        AppSettings.setAutoplay(enabled)
+        if (enabled) {
+            autoplayLoadJob?.cancel()
+            autoplayLoadJob = null
+            autoplaySeed = null
+            loadAutoplayForCurrentTrack()
+        } else {
+            autoplayLoadJob?.cancel()
+            autoplayLoadJob = null
+            autoplaySeed = null
+            dropAutoplayTracksFromQueue()
+            // Switching AutoPlay off is the listener saying they don't want
+            // those tracks; leaving a stash behind would put them back the next
+            // time repeat-all ended.
+            repeatAllStash = emptyList()
+            repeatAllStashSeed = null
+        }
+        mediaSession?.setCustomLayout(notificationButtons())
+    }
+
+    /**
+     * Tops the queue back up to [MAX_QUEUED_AUTOPLAY] AutoPlay-suggested tracks
+     * ahead of whatever is currently playing. Run on every track change rather
+     * than only once the queue runs dry, so a freshly played suggestion is
+     * replaced by a new one appended after the ones still waiting instead of
+     * everything arriving in one burst at the end of the queue.
+     */
+    private fun loadAutoplayForCurrentTrack() {
+        val exoPlayer = player ?: return
+        if (!AppSettings.autoplay.value || exoPlayer.repeatMode == Player.REPEAT_MODE_ALL) {
+            return
+        }
+        val current = exoPlayer.currentMediaItem?.toSong() ?: return
+        if (AppSettings.dontRepeatSuggestions.value) sessionSongHistory += current
+        val queuedAutoplay = (exoPlayer.currentMediaItemIndex + 1 until exoPlayer.mediaItemCount)
+            .count { exoPlayer.getMediaItemAt(it).fromAutoplay }
+        val needed = MAX_QUEUED_AUTOPLAY - queuedAutoplay
+        if (needed <= 0) return
+        if (autoplaySeed == current.videoId) return
+        autoplaySeed = current.videoId
+        autoplayLoadJob = scope.launch {
+            val queueSongs = (0 until exoPlayer.mediaItemCount)
+                .map { exoPlayer.getMediaItemAt(it).toSong() }
+            val existing = if (AppSettings.dontRepeatSuggestions.value) {
+                queueSongs + sessionSongHistory
+            } else {
+                queueSongs
+            }
+            loadAutoplayTracks(existing, current, needed)
+                .onSuccess { resolved ->
+                    val activePlayer = player ?: return@onSuccess
+                    if (!AppSettings.autoplay.value ||
+                        activePlayer.currentMediaItem?.mediaId != current.videoId
+                    ) {
+                        return@onSuccess
+                    }
+                    activePlayer.addMediaItems(resolved.map { it.toMediaItem() })
+                    if (AppSettings.dontRepeatSuggestions.value) sessionSongHistory += resolved
+                }
+                .onFailure {
+                    TrackLog.w("BitChord", "notification autoplay failed: ${it.message}", about = current.videoId)
+                }
+        }
+    }
+
+    /**
+     * Takes back what AutoPlay queued and hasn't played yet — what switching
+     * AutoPlay off means for a queue it has already been extending. Removed
+     * from the bottom up so the indexes ahead of each removal still hold, and
+     * handed back in queue order for the one caller that intends to put them
+     * in again.
+     */
+    private fun dropAutoplayTracksFromQueue(): List<MediaItem> {
+        val exoPlayer = player ?: return emptyList()
+        val dropped = mutableListOf<MediaItem>()
+        for (index in exoPlayer.mediaItemCount - 1 downTo exoPlayer.currentMediaItemIndex + 1) {
+            val item = exoPlayer.getMediaItemAt(index)
+            if (!item.fromAutoplay) continue
+            dropped += item
+            exoPlayer.removeMediaItem(index)
+        }
+        return dropped.reversed()
+    }
+
+    /** Clears the queue's AutoPlay tail for the duration of repeat-all, keeping it to put back. */
+    private fun stashAutoplayTracks() {
+        val exoPlayer = player ?: return
+        // Only ever taken once per stretch of repeat-all: cycling
+        // OFF -> ALL -> ONE -> OFF sets the mode three times, and the second
+        // and third of those must not overwrite a full stash with the empty
+        // queue tail the first one left behind.
+        if (repeatAllStash.isNotEmpty()) return
+        val dropped = dropAutoplayTracksFromQueue()
+        if (dropped.isEmpty()) return
+        repeatAllStash = dropped
+        repeatAllStashSeed = exoPlayer.currentMediaItem?.mediaId
+    }
+
+    /**
+     * Puts the stashed AutoPlay tracks back when repeat-all ends.
+     *
+     * Refused, rather than forced, in the cases where the stash no longer
+     * describes the queue: AutoPlay switched off while the loop ran, or the
+     * loop played on past the track the stash was taken behind. Both leave
+     * [loadAutoplayForCurrentTrack] to fill the queue the ordinary way.
+     */
+    private fun restoreAutoplayTracks() {
+        val exoPlayer = player ?: return
+        val stashed = repeatAllStash
+        val seed = repeatAllStashSeed
+        repeatAllStash = emptyList()
+        repeatAllStashSeed = null
+        // The seed is stale now either way, so the queue can be topped up again
+        // for this track — without this the guard in [loadAutoplayForCurrentTrack]
+        // reads a track it has already loaded for and returns, which is how a
+        // queue whose stash was refused ended up with nothing after it at all.
+        autoplayLoadJob?.cancel()
+        autoplayLoadJob = null
+        autoplaySeed = null
+        if (stashed.isEmpty() || !AppSettings.autoplay.value) return
+        if (exoPlayer.currentMediaItem?.mediaId != seed) return
+        // A track the listener queued by hand during the loop is not queued
+        // twice for having been in the mix before it.
+        val present = (0 until exoPlayer.mediaItemCount)
+            .mapTo(mutableSetOf()) { exoPlayer.getMediaItemAt(it).mediaId }
+        val restored = stashed.filter { it.mediaId !in present }
+        if (restored.isEmpty()) return
+        exoPlayer.addMediaItems(restored)
+    }
+
+    private fun toggleFavoriteFromNotification(videoId: String) {
+        favoriteActionJob?.cancel()
+        val previous = LikeState.overrides.value[videoId] ?: LikeStatus.INDIFFERENT
+        val target = if (previous == LikeStatus.LIKE) {
+            LikeStatus.INDIFFERENT
+        } else {
+            LikeStatus.LIKE
+        }
+
+        // Match the player UI: update both surfaces immediately, then reconcile
+        // the optimistic state with YouTube in the background.
+        LikeState.set(videoId, target)
+        mediaSession?.setCustomLayout(notificationButtons())
+        favoriteActionJob = scope.launch {
+            YtMusicRepository.rate(videoId, target)
+                .onFailure {
+                    LikeState.set(videoId, previous)
+                    mediaSession?.setCustomLayout(notificationButtons())
+                    TrackLog.w("BitChord", "notification favorite failed: ${it.message}", about = videoId)
+                }
+        }
     }
 
     /**
@@ -725,7 +1432,7 @@ class PlaybackService : MediaSessionService() {
         incoming.addListener(playbackListener)
         incoming.addAnalyticsListener(formatListener)
 
-        mediaSession?.player = SessionPlayer(incoming, requireNotNull(crossfade))
+        mediaSession?.player = SessionPlayer(incoming, requireNotNull(crossfade)) { lastPublishedSubtitle }
 
         // The queue moving on used to arrive here as an item transition on the
         // one player that owned the queue. It cannot any more — the incoming
@@ -740,6 +1447,16 @@ class PlaybackService : MediaSessionService() {
             reason = Player.MEDIA_ITEM_TRANSITION_REASON_AUTO,
             alreadyAudible = true,
         )
+
+        // A crossfade starts the incoming item on the player that was idle, so
+        // it never delivers onMediaItemTransition to playbackListener. Keep
+        // AutoPlay's refill on the same track-change path as the ordinary
+        // player transition: otherwise the initial suggestions are consumed
+        // one by one and a long background session eventually runs dry.
+        autoplayLoadJob?.cancel()
+        autoplayLoadJob = null
+        autoplaySeed = null
+        loadAutoplayForCurrentTrack()
     }
 
     /**
@@ -809,10 +1526,57 @@ class PlaybackService : MediaSessionService() {
         alreadyAudible: Boolean = false,
     ) {
         val exoPlayer = player ?: return
-        // A new track is a clean slate for [recoverFrom]. The count
-        // exists to stop one broken stream looping, not to hold a
-        // grudge against a track for the rest of the session.
-        recoveries.clear()
+
+        // A crossfade handoff never fires [formatListener] for the entering
+        // track — [CrossfadeController] starts its decoder during ARMING,
+        // while the listener is still on the outgoing player, and it isn't
+        // reattached until this handoff, by which point the format has
+        // already been reported once and won't be again. The claim from
+        // source resolution stands in until the decoder itself confirms or
+        // corrects it — see [formatListener]'s onAudioInputFormatChanged.
+        activeTrackIsDolbyAtmos = NerdStats.declaredFormat(mediaItem?.mediaId)?.isDolbyAtmos == true
+        applySpatialAudioEnabled()
+
+        // Keep a real, bounded history in the player rather than merely hiding
+        // old rows in Compose. MediaController mirrors the playlist across the
+        // session boundary, persistence snapshots it, and crossfade duplicates
+        // it onto the standby player, so letting completed entries accumulate
+        // made every one of those paths progressively more expensive.
+        val expiredHistory = queueHistoryTrimCount(exoPlayer.currentMediaItemIndex)
+        if (expiredHistory > 0) {
+            if (exoPlayer.repeatMode == Player.REPEAT_MODE_ALL) {
+                // Repeat-all still means the whole queue. Rotate history that
+                // has fallen out of the visible 25-song window to the end
+                // instead of deleting it; it becomes upcoming again in the
+                // same order and the loop can continue indefinitely.
+                repeat(expiredHistory) {
+                    exoPlayer.moveMediaItem(0, exoPlayer.mediaItemCount - 1)
+                }
+            } else {
+                exoPlayer.removeMediaItems(0, expiredHistory)
+            }
+        }
+        // A *different* track is a clean slate for [recoverFrom], and so is the
+        // same track becoming current for any reason other than that method's
+        // own retry. The distinction is the whole of the reported loading loop.
+        //
+        // This was an unconditional clear, on the reasoning that the count exists
+        // to stop one broken stream looping rather than to hold a grudge for the
+        // session — and that reasoning is right about the listener pressing play
+        // again, which is why it is kept below. What it missed is that "a track
+        // became current" is not the same event as "something other than the
+        // retry happened": ExoPlayer fires a transition for PLAYLIST_CHANGED and
+        // for SEEK, and [recoverFrom]'s recovery *is* a seek — so the counter was
+        // reset by the very retries it was counting. The report shows four resets
+        // in 2m41s, each followed by a fresh "attempt 1", eight failures against
+        // a budget of two, and roughly twenty-seven full resolve walks for one
+        // unplayable track. [retryingMediaId] is the one case that must not
+        // reset; everything else still does.
+        val becameCurrent = mediaItem?.mediaId
+        if (becameCurrent == null || becameCurrent != retryingMediaId) {
+            recoveries.clear()
+        }
+        retryingMediaId = null
 
         // Where the wait starts, for the log in onIsPlayingChanged — unless
         // there was no wait. A crossfaded track has been audible for as long as
@@ -827,6 +1591,12 @@ class PlaybackService : MediaSessionService() {
                 "TIMING first audio: 0ms, the crossfade covered it",
                 about = mediaItem?.mediaId,
             )
+            // The other way a track becomes audible. `onIsPlayingChanged` never
+            // fires across a crossfade handoff — the incoming track has been
+            // sounding since before it was current — so without this a blended
+            // advance would leave every track looking like it never started.
+            audibleMediaId = mediaItem?.mediaId
+            consecutiveErrorSkips = 0
         }
         // And the same instant on the wall clock, which is the one
         // logcat stamps its lines with — see [TrackLog].
@@ -844,9 +1614,16 @@ class PlaybackService : MediaSessionService() {
 
         // Scrobbling: stop old song, start new song
         scrobbleManager?.onSongStop()
+        // And the local record, which needs the transition even when the track
+        // id doesn't change: repeat-one plays the same song again, and without
+        // this the second play through is a continuation of the first and is
+        // never counted.
+        ListeningRecorder.onStopped()
         val newSong = mediaItem?.toSong()
         val durationMs = exoPlayer.duration.takeIf { it > 0 }
-        scrobbleManager?.onSongStart(newSong, durationMs)
+        if (exoPlayer.isPlaying) {
+            scrobbleManager?.onSongStart(newSong, durationMs)
+        }
 
         // ListenBrainz: submit finished for old song, playing_now for new song.
         // The finished listen only counts when the track actually ended —
@@ -856,13 +1633,13 @@ class PlaybackService : MediaSessionService() {
         val ended = previousEnded
         val prevSong = listenBrainzSong
         val prevStart = listenBrainzStartMs
-        if (prevSong != null && ended) {
+        if (prevSong != null && ended && prevStart > 0L) {
             submitListenBrainzFinished(prevSong, prevStart, listenBrainzDurationMs)
         }
         listenBrainzSong = newSong
-        listenBrainzStartMs = System.currentTimeMillis()
+        listenBrainzStartMs = if (exoPlayer.isPlaying) System.currentTimeMillis() else 0L
         listenBrainzDurationMs = durationMs
-        if (newSong != null) {
+        if (newSong != null && exoPlayer.isPlaying) {
             submitListenBrainzPlayingNow(newSong, 0L, durationMs)
         }
 
@@ -879,6 +1656,7 @@ class PlaybackService : MediaSessionService() {
             SleepTimer.cancel()
         }
         if (exoPlayer.isPlaying) registerCurrentPlay()
+        savePlaybackState(exoPlayer)
         prefetchAround(exoPlayer)
         // The second look belongs to the track it was started for; the
         // queue moving on ends it, whatever it had found — and starts
@@ -889,7 +1667,11 @@ class PlaybackService : MediaSessionService() {
         // the sampler in [reportProgress].
         upgradeJob?.cancel()
         lookForBetterCopy(exoPlayer)
-        saveQueue()
+        // Covers crossfades too: a blended advance never reaches
+        // onMediaItemTransition, and [adoptPlayer] calls this handler by hand.
+        publishWidgetState()
+        loadLyricsForCurrentTrack()
+        if (exoPlayer.isPlaying) startLyricsTicker()
         // Cleared rather than re-published. The renderer is still
         // configured for the track that just ended at this point, so
         // reading the format here reports the *previous* song — which
@@ -904,29 +1686,6 @@ class PlaybackService : MediaSessionService() {
         NerdStats.current.value = null
     }
 
-    /**
-     * Loads the queue from the last session so the app opens on the track it
-     * was left on, rather than with nothing in the mini player.
-     *
-     * Deliberately no `prepare()`. Preparing would resolve the stream — a
-     * NewPipe extraction over the network — on every cold start, for a track
-     * that may never be played, and would post a media notification for a
-     * session nobody has touched yet (Media3 shows one as soon as the player
-     * leaves IDLE with a non-empty queue). Left idle, restoring costs nothing:
-     * [MediaSession] routes every play request through
-     * `Util.handlePlayButtonAction`, which prepares an idle player first, so
-     * the mini player, the notification and Bluetooth all resume from here
-     * without knowing the queue was cold.
-     */
-    private fun restoreLastQueue(player: ExoPlayer) {
-        val last = LastPlayed.load() ?: return
-        player.setMediaItems(
-            last.songs.map { it.toMediaItem() },
-            last.index,
-            last.positionMs,
-        )
-    }
-
     /** The background hunt for a better copy of whatever is playing. */
     private var upgradeJob: Job? = null
 
@@ -939,6 +1698,57 @@ class PlaybackService : MediaSessionService() {
      * the queue genuinely moves on, not when a track merely re-prepares.
      */
     private val recoveries = mutableMapOf<String, Int>()
+
+    /**
+     * The track [recoverFrom] is about to seek-and-prepare, so that the
+     * transition its own retry may fire can be told from the queue moving on or
+     * the listener asking again — see [onTrackBecameCurrent]. Cleared by the
+     * transition it describes, the same way [swappingMediaId] is.
+     */
+    private var retryingMediaId: String? = null
+
+    /**
+     * Media3's retry budget, with one thing added: a load error that cannot
+     * succeed on a second attempt does not get one.
+     *
+     * There was no policy here at all, which meant
+     * [DefaultLoadErrorHandlingPolicy] — three tries at a 1s/2s/3s backoff,
+     * against *any* IOException. Stacked on top of this service's own
+     * [MAX_RECOVERIES] counter and read-ahead's independent resolves, that is
+     * where the "infinite loading" came from: the app logged
+     * "leaving it alone" after its third attempt, and then Media3 quietly
+     * started a fourth on its own schedule — visible in the report as a full
+     * resolve walk beginning with no track selection before it, forty seconds
+     * after the app had given up. Nothing in the log named it, because nothing
+     * in the app had asked for it.
+     *
+     * Only [StreamResolver.PermanentlyUnplayableException] is refused, and it is
+     * refused rather than delayed because the resolver has already established
+     * the answer cannot change — it is the type it uses to say exactly that.
+     * Everything else keeps the default behaviour, which is right: a shaped
+     * response or a dropped connection is worth another go.
+     */
+    private class PermanentAwareLoadErrorPolicy : DefaultLoadErrorHandlingPolicy() {
+        override fun getRetryDelayMsFor(loadErrorInfo: LoadErrorHandlingPolicy.LoadErrorInfo): Long {
+            if (isPermanent(loadErrorInfo.exception)) return C.TIME_UNSET
+            return super.getRetryDelayMsFor(loadErrorInfo)
+        }
+
+        private fun isPermanent(error: Throwable?): Boolean {
+            var cause = error
+            var depth = 0
+            while (cause != null && depth++ < CAUSE_DEPTH) {
+                if (cause is StreamResolver.PermanentlyUnplayableException) return true
+                cause = cause.cause?.takeIf { it !== cause }
+            }
+            return false
+        }
+
+        private companion object {
+            /** Media3 and the coroutine machinery both wrap; nothing nests deeper than this. */
+            const val CAUSE_DEPTH = 8
+        }
+    }
 
     /**
      * Puts a track that died mid-read back on its feet.
@@ -969,6 +1779,37 @@ class PlaybackService : MediaSessionService() {
             error,
             about = mediaId,
         )
+        // A local file that is not there is the one failure retrying cannot
+        // touch, and the only one where the fix is to stop asking for the file.
+        //
+        // Everything below this point recovers a *stream*: it discards cached
+        // bytes, releases the choice of who serves the track, and prepares the
+        // same item again. Against `file:///…/Drake - Janice STFU.m4a` that is
+        // all wasted — the uri is baked into the item already in the timeline,
+        // so `prepare()` reopens the identical dead path and fails identically.
+        // Observed as eight `ERROR_CODE_IO_FILE_NOT_FOUND`s in three seconds
+        // against a download whose file had been deleted from a file manager,
+        // ending in a track that simply refused to play.
+        //
+        // Rebuilding the item without its local uri is what turns that into a
+        // stream, and dropping the record is what stops the next play walking
+        // into the same hole. Deliberately ahead of the verdict and the attempt
+        // budget below: this is not an attempt spent, it is a different source.
+        if (error.errorCode == PlaybackException.ERROR_CODE_IO_FILE_NOT_FOUND &&
+            restreamMissingLocalFile(player, item, uri, position)
+        ) {
+            return
+        }
+        // A manifest read as audio is not a broken stream, and everything below
+        // this line would treat it as one. Ahead of the verdict and the attempt
+        // budget for the same reason as the local-file case above: this is not
+        // an attempt spent on the same stream, it is the same stream opened
+        // correctly for the first time.
+        if (error.errorCode == PlaybackException.ERROR_CODE_PARSING_CONTAINER_UNSUPPORTED &&
+            replayAsManifest(player, item, uri, position)
+        ) {
+            return
+        }
         // Giving up on the *retry*, not on everything below it.
         //
         // A track that has exhausted its attempts is not finished with.
@@ -988,8 +1829,24 @@ class PlaybackService : MediaSessionService() {
         //
         // So everything from here to the discard runs either way, and only the
         // seek-and-prepare at the end is skipped.
-        val givingUp = attempts > MAX_RECOVERIES
-        if (givingUp) {
+        //
+        // A verdict counts as exhausting the attempts immediately. The resolver
+        // only throws [StreamResolver.PermanentlyUnplayableException] once it has
+        // established that no client, no session and no extraction can serve the
+        // track, so the two further attempts this would otherwise spend are two
+        // more full walks for an answer already in hand — and in the report they
+        // were exactly that, at roughly seventeen youtubei requests each.
+        val verdict = permanentReason(error)
+        val givingUp = verdict != null || attempts > MAX_RECOVERIES
+        // A track that has never made a sound has *failed to start*, whatever
+        // the error was, and the queue should move past it once the attempts are
+        // spent — see [skipReason]. Read here rather than after the delay below,
+        // because the seek-and-prepare of an unrelated recovery could move the
+        // player on in between.
+        val neverStarted = audibleMediaId != mediaId
+        if (verdict != null) {
+            TrackLog.w("BitChord", "$mediaId cannot be played: $verdict", about = mediaId)
+        } else if (givingUp) {
             TrackLog.w("BitChord", "$mediaId has failed $attempts times; leaving it alone", about = mediaId)
         }
         // The upgraded rendition goes with the cache entry it lived in, so the
@@ -1043,15 +1900,275 @@ class PlaybackService : MediaSessionService() {
             // resolves freely, lands on a different source, and streams it into
             // the middle of the last one. Releasing the choice without dropping
             // the bytes would trade one stuck track for a corrupt one.
-            if (givingUp) return@launch
+            if (givingUp) {
+                // A track nobody can play must not leave the player parked in
+                // IDLE on it. Nothing else in this service calls prepare() again,
+                // so before this the queue simply stopped: the notification kept
+                // showing the song, the play button kept doing nothing, and from
+                // the outside that is indistinguishable from a hung app — which
+                // is what the report describes and what "it was stuck on my
+                // phone too" means. Moving on is the only honest answer.
+                skipReason(verdict, error, neverStarted, attempts)?.let { reason ->
+                    withContext(Dispatchers.Main) { skipPastUnplayable(mediaId, reason) }
+                }
+                return@launch
+            }
             withContext(Dispatchers.Main) {
                 val player = this@PlaybackService.player ?: return@withContext
                 if (player.currentMediaItem?.mediaId != mediaId) return@withContext
                 TrackLog.d("BitChord", "retrying $mediaId from ${position}ms")
+                // Claimed before the seek, so the transition it may fire is
+                // recognised as this retry rather than read as a fresh start and
+                // handed a fresh attempt budget.
+                retryingMediaId = mediaId
                 player.seekTo(player.currentMediaItemIndex, position)
                 player.prepare()
             }
         }
+    }
+
+    /**
+     * Swaps a track whose downloaded file has gone missing back onto a stream,
+     * in place and at the same position.
+     *
+     * The file was downloaded and then deleted from under the app — a file
+     * manager, a cleaner, a wiped SD card — leaving [Downloads]' record pointing
+     * at nothing. [Song.toMediaItem] checks that record before it builds an
+     * item, but only at build time: an item already sitting in the timeline was
+     * built when the file was still there can retain that stale URI while it
+     * waits in the live queue. This is the other end of that, and the only one
+     * that can see the file is gone rather than guess.
+     *
+     * The record goes first, then the item is rebuilt from its own metadata with
+     * the local uri stripped, which sends [Song.toMediaItem] down its streaming
+     * branch. Position is kept, so this reads as the hiccup [recoverFrom] is
+     * written around rather than the song starting over.
+     *
+     * @return false when this is not that situation and the caller should carry
+     *   on with its ordinary stream recovery — including the case where stripping
+     *   the local uri changes nothing, which is a device-library track whose
+     *   mediaId *is* the missing file and for which there is no stream to fall
+     *   back to. Returning true there would be a swap that fixes nothing, on a
+     *   loop.
+     */
+    private fun restreamMissingLocalFile(
+        player: ExoPlayer,
+        item: MediaItem,
+        uri: Uri?,
+        position: Long,
+    ): Boolean {
+        val scheme = uri?.scheme
+        if (scheme != "file" && scheme != "content") return false
+        val mediaId = item.mediaId
+
+        Downloads.forgetMissing(mediaId)
+        val restreamed = item.toSong().copy(localUri = null, localPath = null).toMediaItem()
+        if (restreamed.localConfiguration?.uri == uri) {
+            TrackLog.w(
+                "BitChord",
+                "$mediaId is a local file that is gone and has no stream behind it",
+                about = mediaId,
+            )
+            return false
+        }
+
+        TrackLog.w(
+            "BitChord",
+            "$mediaId was downloaded but $uri is gone; streaming it instead",
+            about = mediaId,
+        )
+        // Not claimed as [retryingMediaId], unlike the seek-and-prepare retry
+        // below: that flag exists to stop a retry against the *same* stream
+        // refilling its own attempt budget, and this is a different source
+        // entirely. Letting the transition clear the count is the right answer
+        // here — a stream that has never been tried deserves the full budget.
+        recoveries.remove(mediaId)
+        player.replaceMediaItem(player.currentMediaItemIndex, restreamed)
+        player.seekTo(player.currentMediaItemIndex, position)
+        player.prepare()
+        return true
+    }
+
+    /**
+     * Reopens a track whose stream turned out to be a manifest, with the type
+     * declared this time.
+     *
+     * The net under everything else in this file that tries not to reach a
+     * manifest through a progressive source — [StreamContainer] has the full
+     * account of why one cannot be played that way and how it happens anyway.
+     * The live path now declines to substitute one at all, but that is only the
+     * `bitchord://watch?v=…` half: a track queued from a module's own search
+     * results plays through `bitchord://source?…`, is resolved by that module
+     * and by nothing else, and has no YouTube copy to start on. For those there
+     * is no choice to make in advance, and this is the only place that can see
+     * what actually came back.
+     *
+     * What makes it safe to act on is that the URL is not in doubt. The
+     * resolving data source records what it served ([StreamContainer.served]),
+     * so this is not an inference from an error code — the error only says
+     * "nothing could read these bytes", and the record says the bytes were an
+     * `.mpd`. Declaring the type is then the whole fix: same item, same URL,
+     * same position, a `DashMediaSource` instead of a progressive one.
+     *
+     * The cached bytes go first. They are the manifest, written under the
+     * track's ordinary key by the read that failed, and leaving them there
+     * invites the segments that follow to be appended to an index — the seam
+     * this file's [StreamChoice] note is about, reached from a new direction.
+     * [StreamChoice] itself is deliberately left alone: the whole point is to
+     * come back to the *same* stream, and forgetting the pin would send the
+     * reopen off to race for a different one.
+     *
+     * @return false when this is not that situation — no record, nothing
+     *   manifest-shaped, or an item that already declares its type and so has
+     *   failed for some other reason — and the caller should carry on with its
+     *   ordinary stream recovery.
+     */
+    private fun replayAsManifest(
+        player: ExoPlayer,
+        item: MediaItem,
+        uri: Uri?,
+        position: Long,
+    ): Boolean {
+        val mediaId = item.mediaId
+        // Already declared, and still unreadable: this is a real failure and
+        // re-preparing the identical item would only spend the budget on it.
+        if (item.localConfiguration?.mimeType != null) return false
+        val mime = StreamContainer.manifestServing(mediaId) ?: return false
+
+        TrackLog.w(
+            "BitChord",
+            "$mediaId was served a manifest through a progressive source; reopening it as $mime",
+            about = mediaId,
+        )
+        // Not claimed as [retryingMediaId], on the same reasoning as
+        // [restreamMissingLocalFile]: that flag stops a retry against the same
+        // stream refilling its own budget, and this is the first attempt this
+        // stream has had that could possibly work.
+        recoveries.remove(mediaId)
+        val declared = item.buildUpon().setMimeType(mime).build()
+        scope.launch(TrackLog.about(mediaId)) {
+            uri?.let { withContext(Dispatchers.IO) { AudioCache.discard(it) } }
+            withContext(Dispatchers.Main) {
+                val live = this@PlaybackService.player ?: return@withContext
+                // The queue can move while the discard runs, and replacing the
+                // current item then would rewrite whatever the listener skipped
+                // to instead.
+                if (live.currentMediaItem?.mediaId != mediaId) return@withContext
+                live.replaceMediaItem(live.currentMediaItemIndex, declared)
+                live.seekTo(live.currentMediaItemIndex, position)
+                live.prepare()
+            }
+        }
+        return true
+    }
+
+    /**
+     * Why a track that has run out of attempts should be left behind, or null
+     * to park on it as the queue used to.
+     *
+     * Two things get past here.
+     *
+     * A [verdict] always does, unconditionally and exactly as it did before this
+     * function existed: the resolver has established the track cannot be served
+     * by anyone, and a playlist with a run of age-gated or region-locked tracks
+     * in it should walk straight through them.
+     *
+     * Everything else gets past only when the track never made a sound. The
+     * error itself is not consulted — a 403, a dead socket, a codec that will
+     * not initialise and a cache entry that will not open are all, from the
+     * listener's side, the same event: they pressed play and nothing happened.
+     * Waiting for a *classification* of that is what left the queue parked on
+     * tracks whose only sin was an error nobody had taught the service to name.
+     * What is consulted is [neverStarted], because the one failure that must not
+     * move the queue is the one in the middle of a song someone is listening to:
+     * the attempts are spent, the recovery has already put them back where they
+     * were twice, and jumping to the next track at that point would take the
+     * song away rather than rescue it.
+     *
+     * [MAX_CONSECUTIVE_SKIPS] is the floor under the rest. Nothing here can tell
+     * a broken track from a broken network, and offline every track in the queue
+     * fails identically — so without a limit a dropped connection would quietly
+     * walk to the end of the queue, spending a full attempt budget per track,
+     * and hand back a queue the listener no longer recognises. Stopping instead
+     * leaves the error on the player, which is what puts a message on screen,
+     * and leaves the queue where it was. The count only resets when something
+     * actually plays, so a working track anywhere in a bad patch restores the
+     * full allowance. Verdicts are exempt: they are a statement about one track
+     * rather than a guess, and their skipping is behaviour that already works.
+     */
+    private fun skipReason(
+        verdict: String?,
+        error: PlaybackException,
+        neverStarted: Boolean,
+        attempts: Int,
+    ): String? {
+        if (verdict != null) return verdict
+        if (!neverStarted) return null
+        if (consecutiveErrorSkips >= MAX_CONSECUTIVE_SKIPS) {
+            TrackLog.w(
+                "BitChord",
+                "$MAX_CONSECUTIVE_SKIPS tracks in a row failed to start; " +
+                    "this is the queue or the connection, not the track — stopping here",
+            )
+            return null
+        }
+        consecutiveErrorSkips++
+        return "failed to start after $attempts attempts (${error.errorCodeName})"
+    }
+
+    /**
+     * Leave a track the resolver has ruled out and carry on down the queue.
+     *
+     * The item is left in place rather than removed: the listener queued it, and
+     * the reason it cannot be played is usually temporary in a way this service
+     * cannot see the end of — signing in clears an age gate, travelling clears a
+     * region block, and a stream that 403s now resolves again in an hour.
+     * Removing it would quietly rewrite a queue on the strength of a ten-minute
+     * verdict.
+     *
+     * Whether a failure has earned this at all is [skipReason]'s decision, not
+     * this method's; by here the answer is yes.
+     *
+     * With nothing after it there is nowhere to go, and stopping is then the
+     * correct end state rather than a failure to recover: the error stays on the
+     * player, which is what puts a message in front of the listener — see
+     * `rememberPlayerState` in
+     * [PlayerConnection][com.music.bitchord.playback.PlayerConnection].
+     */
+    private fun skipPastUnplayable(mediaId: String, reason: String) {
+        val exoPlayer = player ?: return
+        if (exoPlayer.currentMediaItem?.mediaId != mediaId) return
+        if (!exoPlayer.hasNextMediaItem()) {
+            TrackLog.w("BitChord", "$reason — and nothing after it in the queue", about = mediaId)
+            return
+        }
+        TrackLog.w("BitChord", "$reason — skipping to the next track", about = mediaId)
+        exoPlayer.seekToNextMediaItem()
+        // No play() here: an error does not clear playWhenReady, so prepare()
+        // resumes exactly as far as the listener had asked for. Calling play()
+        // would un-pause a queue they had paused.
+        exoPlayer.prepare()
+    }
+
+    /**
+     * Why [error] means "never", or null if it only means "not just now".
+     *
+     * Unwrapped by hand because the classification is the resolver's and the
+     * exception has been through Media3's loader by the time it arrives:
+     * `ExoPlaybackException` wrapping `Loader.UnexpectedLoaderException` wrapping
+     * what the resolver actually threw. A shallow `is` check sees only the
+     * outermost of those three.
+     */
+    private fun permanentReason(error: Throwable?): String? {
+        var cause = error
+        var depth = 0
+        while (cause != null && depth++ < PERMANENT_CAUSE_DEPTH) {
+            if (cause is StreamResolver.PermanentlyUnplayableException) {
+                return cause.message ?: "This track cannot be played"
+            }
+            cause = cause.cause?.takeIf { it !== cause }
+        }
+        return null
     }
 
     /**
@@ -1189,6 +2306,43 @@ class PlaybackService : MediaSessionService() {
                 NerdStats.onLosslessRaceEnd(mediaId)
             }
         }
+    }
+
+    /**
+     * Goes looking for a better copy of the playing track because the listener
+     * asked for one — the player menu's "Upgrade quality".
+     *
+     * The way back from a revert, and the only thing that clears one: a track
+     * pinned to YouTube's own upload is pinned against the automatic path
+     * precisely so a search cannot quietly undo what the listener chose, so the
+     * request to search again has to come from the same place the revert did.
+     * See [OriginalVersion].
+     *
+     * Nothing is replaced here, and that is the whole of the design. The
+     * obvious version of this rebuilt the reverted item as the ordinary,
+     * substitutable entry it would have been queued as, and let the automatic
+     * path take it from there. It worked, and it cost two breaks in the audio
+     * where the feature only justifies one: the rebuild stopped the track and
+     * started it again on the very same YouTube stream, seconds before the
+     * upgrade landed and stopped it a second time. The first of those bought
+     * nothing — nothing better had even been found yet.
+     *
+     * So the item is left exactly as it is and the search runs under it. The
+     * two things standing in the way of that are handled where they live:
+     * [QualityUpgrade.askByHand] exempts a reverted item's rendition marker
+     * from the rule that would otherwise read it as "already upgraded", and
+     * [QualityUpgrade.upgradedUri] drops `direct_youtube` from the URI it
+     * builds, so the swap — when there is something worth swapping to — is
+     * served the copy that was found rather than the one being replaced. The
+     * listener hears one cut, for the change they asked for.
+     */
+    private fun upgradeQualityNow() {
+        val player = player ?: return
+        val mediaId = player.currentMediaItem?.mediaId ?: return
+        OriginalVersion.unpin(mediaId)
+        QualityUpgrade.askByHand(mediaId)
+        TrackLog.d("BitChord", "upgrade asked for by hand for $mediaId", about = mediaId)
+        lookForBetterCopy(player)
     }
 
     /**
@@ -1335,19 +2489,20 @@ class PlaybackService : MediaSessionService() {
             return
         }
 
-        // Never in the first few seconds. An upgrade that lands the instant a
-        // track starts would otherwise cut it a millisecond in — the listener
-        // hears the song begin, stop and begin again, which reads as a bug
-        // whatever the bitrate afterwards. Letting the opening play through
-        // costs nothing: the better copy is not going anywhere.
+        // There used to be an unconditional five-second hold here, keyed off the
+        // track's own position, so that an upgrade arriving with the first note
+        // could not cut the song a millisecond in. Its own reasoning said it was
+        // "almost always already past by now", and that turned out to be the
+        // whole story: by the time this line is reached the search, the stream
+        // lookup and the audition have all run, and the audition alone spends
+        // seconds on the network. So the guard was not usually deciding to wait
+        // — it was adding its five seconds to whatever the swap had already
+        // cost, on exactly the tracks that had been quickest to find a better
+        // copy. Removed rather than shortened: it is the crossfade grace below
+        // that protects the case an upgrade can genuinely spoil, and it does so
+        // by asking whether a transition actually happened rather than assuming
+        // one might have.
         //
-        // Almost always already past by now: the audition above spends seconds
-        // on the network, and it spends them with the music still playing.
-        val settled = withContext(Dispatchers.Main) { player?.currentPosition ?: 0L }
-        if (settled < UPGRADE_NOT_BEFORE_MS) {
-            delay(UPGRADE_NOT_BEFORE_MS - settled)
-        }
-
         // Never cut into a crossfade in flight. `replaceMediaItem` tears the
         // session player's source down and rebuilds it — CrossfadeController
         // is either syncing its tail player's position against that same
@@ -1381,8 +2536,9 @@ class PlaybackService : MediaSessionService() {
         // milliseconds after the incoming track finally stood alone: the
         // listener hears the mix land and the music stop, in that order, which
         // reads as the transition having broken rather than as a track quietly
-        // getting better. [UPGRADE_NOT_BEFORE_MS] does not cover this — that is
-        // measured from the track's own start, and an Automix hands over at a
+        // getting better. This is the one delay on this path, and it is why the
+        // blanket one above it could go: a hold measured from the track's own
+        // start never covered this case anyway, since an Automix hands over at a
         // cue point that can be well past it.
         //
         // Keyed off when a transition last ended rather than off whether the
@@ -1455,15 +2611,36 @@ class PlaybackService : MediaSessionService() {
             val previousFormat = NerdStats.declaredFormat(mediaId)
             swappingMediaId = mediaId
             swapCutAt = SystemClock.elapsedRealtime()
+            val upgradedMetadata = now.item.mediaMetadata.buildUpon()
+                .setExtras(Bundle(now.item.mediaMetadata.extras ?: Bundle()).apply {
+                    putBoolean(EXTRA_QUALITY_UPGRADED, true)
+                })
+                .build()
             player.replaceMediaItem(
                 player.currentMediaItemIndex,
-                now.item.buildUpon().setUri(upgradedUri).build(),
+                now.item.buildUpon()
+                    .setUri(upgradedUri)
+                    .setMediaMetadata(upgradedMetadata)
+                    .withResolvedStreamType(stream.url)
+                    .build(),
             )
             player.seekTo(player.currentMediaItemIndex, now.position)
             player.prepare()
             QualityUpgrade.unshelve(mediaId)
             TrackLog.d("BitChord", "upgraded to ${stream.format.summary} at ${now.position}ms")
             watchUpgrade(mediaId, now.uri, now.position, now.duration, previousFormat)
+            if (QualityUpgrade.continueAfterLossySwap(mediaId)) {
+                // The immediate JioSaavn improvement stays audible while a
+                // slower lossless source is checked against its higher-quality
+                // floor. Wait for this pass to release `upgradeJob`; otherwise
+                // the second pass would see the first one as still active and
+                // return without starting its lookup.
+                val firstPass = upgradeJob
+                scope.launch {
+                    firstPass?.join()
+                    lookForBetterCopy(player)
+                }
+            }
             // The opening again, this time sized for Automix rather than for
             // a container header.
             //
@@ -1485,13 +2662,31 @@ class PlaybackService : MediaSessionService() {
         }
     }
 
-    /** Main thread. Null unless [mediaId] is still current and still un-upgraded. */
+    /** Main thread. Null unless [mediaId] is still current and has another upgrade slot. */
     private fun swapPointFor(mediaId: String): SwapPoint? {
         val player = player ?: return null
         val item = player.currentMediaItem ?: return null
         if (item.mediaId != mediaId) return null
         val uri = item.localConfiguration?.uri?.toString() ?: return null
-        if (uri.contains("${QualityUpgrade.MARKER}=")) return null
+        // One mid-track lossy improvement (typically Opus → JioSaavn) must not
+        // prevent the requested lossless copy from replacing it. Two marked
+        // URIs get distinct cache entries through [QualityUpgrade.upgradedUri].
+        if (uri.contains("${QualityUpgrade.MARKER}=hifi-")) return null
+        // A track the listener is holding on YouTube's own upload is not a
+        // candidate for anything, whatever was already in flight for it. The
+        // revert can land in the middle of a hunt — that is when the "Upgrading
+        // quality" badge makes it most tempting to press — and the search
+        // behind it neither knows nor can be told.
+        //
+        // The pin is the test rather than the item's `direct_youtube`, because
+        // those two come apart in exactly the case this must not block: an
+        // upgrade asked for by hand leaves the reverted item in place and
+        // unpins the track, and swapping against that item is the whole point.
+        // See [OriginalVersion] and [QualityUpgrade.askByHand].
+        if (OriginalVersion.isPinned(mediaId)) {
+            TrackLog.d("BitChord", "no swap for $mediaId: it is held on the original", about = mediaId)
+            return null
+        }
         return SwapPoint(item, uri, player.currentPosition, player.duration)
     }
 
@@ -1574,7 +2769,12 @@ class PlaybackService : MediaSessionService() {
         }
         val audition = withContext(Dispatchers.Main) {
             buildAuditionPlayer().apply {
-                setMediaItem(at.item.buildUpon().setUri(upgradedUri).build())
+                setMediaItem(
+                    at.item.buildUpon()
+                        .setUri(upgradedUri)
+                        .withResolvedStreamType(stream.url)
+                        .build(),
+                )
                 seekTo(at.position)
                 prepare()
             }
@@ -1623,6 +2823,23 @@ class PlaybackService : MediaSessionService() {
         TrackLog.d("BitChord", AudioCache.cachedSummary(Uri.parse(upgradedUri)))
         return warmedThrough
     }
+
+    /**
+     * Tells Media3 the type of a stream found behind one of our virtual
+     * `bitchord://` playback URIs.
+     *
+     * The resolver replaces that URI with the real URL only after
+     * [DefaultMediaSourceFactory] has selected a source implementation. A
+     * Tidal upgrade is a manifest, but its virtual URI has no manifest suffix,
+     * so the factory otherwise locks it into a progressive source and fails to
+     * parse the manifest as audio bytes.
+     *
+     * Which manifest kind arrives is the backend's choice and it has already
+     * changed once — see [StreamContainer], which holds that reasoning and the
+     * test itself now that three paths need it rather than this one.
+     */
+    private fun MediaItem.Builder.withResolvedStreamType(streamUrl: String): MediaItem.Builder =
+        StreamContainer.manifestMimeOf(streamUrl)?.let(::setMimeType) ?: this
 
     /** How an audition in progress is coming along — see [auditionUpgrade]. */
     private sealed interface Audition {
@@ -1907,7 +3124,64 @@ class PlaybackService : MediaSessionService() {
         // out rather than by asking.
         val quick: SourceStream? = select {
             lookup.onAwait { it }
-            fallback.onAwait { null }
+            // A fallback that finished without a URL has not won anything.
+            //
+            // This clause used to yield null unconditionally, which treats "the
+            // YouTube walk is over" as "YouTube has a URL" — true only while
+            // failing was the slow outcome. It no longer is: [StreamResolver]
+            // now answers a known-unplayable track immediately, so the losing
+            // leg crosses the line first and, before this, took the track down
+            // with it while a module lookup that was about to succeed was still
+            // running. Exactly the case in the report — an age-gated track that
+            // YouTube would never serve and a catalogue that had it all along.
+            fallback.onAwait { resolved -> if (resolved.isSuccess) null else lookup.await() }
+        }
+
+        // A manifest cannot be substituted here, however good it is. This
+        // function runs on the loader thread, *inside* the open of a media
+        // source that was built minutes ago from an extensionless
+        // `bitchord://` URI — so the source is already progressive and cannot
+        // be told otherwise, and handing it a manifest is a track that fails
+        // at 0ms rather than a track that plays lossless. See [StreamContainer]
+        // for the log of exactly that.
+        //
+        // Nothing is thrown away for it. What the modules found is passed to
+        // the second look already answered, which is the same handover a lookup
+        // that merely lost the race gets — and [QualityUpgrade]'s swap does
+        // declare the type, so the manifest plays there. The cost is a seam a
+        // few seconds in instead of a clean start, which is the trade this
+        // whole path is built to make.
+        if (quick != null && StreamContainer.isManifest(quick.url)) {
+            val url = runCatching { fallback.await().getOrThrow() }.getOrNull()
+            if (url != null) {
+                TrackLog.d(
+                    "BitChord",
+                    "'${target.title}' was offered ${quick.format.summary} as a manifest; " +
+                        "starting on YouTube and swapping to it under the music",
+                    about = videoId,
+                )
+                val handed = QualityUpgrade.settledForLess(
+                    mediaId = videoId,
+                    target = target,
+                    inFlight = CompletableDeferred(quick),
+                    playing = NerdStats.pickedBitrateKbps(videoId)?.let { StreamFormat(kbps = it) },
+                )
+                if (!handed) NerdStats.onLosslessRaceEnd(videoId)
+                return Resolved.YouTube(url)
+            }
+            // YouTube cannot serve it either, so there is nothing to start on
+            // and nothing to swap from. The manifest goes out as it is: it will
+            // fail its first read, and [replayAsManifest] rebuilds the item
+            // with the type declared and prepares it again. A cut before the
+            // first note beats a track that does not play at all.
+            TrackLog.w(
+                "BitChord",
+                "'${target.title}' has only a manifest and YouTube cannot serve it; " +
+                    "letting it fail once to declare its type",
+                about = videoId,
+            )
+            NerdStats.onLosslessRaceEnd(videoId)
+            return Resolved.Module(quick)
         }
 
         if (quick != null) {
@@ -1952,31 +3226,213 @@ class PlaybackService : MediaSessionService() {
     }
 
     /**
-     * Publishes what the decoder is really being fed, for "stats for nerds".
+     * Depth, rate and channel count for one stream, taken from the stream.
      *
-     * Bitrate is the awkward one: YouTube's WebM and MP4 containers carry no
-     * bitrate field, so [Format.bitrate] arrives as `NO_VALUE` and the honest
-     * figure is whatever named this stream instead. The source's own figure
-     * comes ahead of YouTube's because a track can have both: one resolved
-     * through YouTube and then upgraded to a module stream mid-song has a
-     * stale 160 sitting in [NerdStats.pickedBitrateKbps] describing audio that
-     * stopped playing several seconds ago. Anything still unknown is left null
-     * for the UI to omit — better a shorter line than a made-up number.
+     * Kept as a value rather than read field-by-field off [Format] because
+     * for some containers the fields are not all in the same place — see
+     * [measure].
+     */
+    private class Measured(
+        val sampleRateHz: Int?,
+        val channels: Int?,
+        val bitDepth: Int?,
+    ) {
+        /**
+         * What the samples cost per second once decoded, in kbps.
+         *
+         * `16-bit · 44.1 kHz · stereo` is 1411, `24-bit · 96 kHz · stereo` is
+         * 4608 — the figures Tidal, Qobuz and Apple Music all put next to a
+         * lossless track, and the only bitrate that means anything for one.
+         * A FLAC's *compressed* rate is a property of how compressible that
+         * particular recording was, so two copies of the same master at the
+         * same quality report different numbers and the comparison the reader
+         * is trying to make doesn't survive it.
+         *
+         * Null unless all three are known: two thirds of this product is not
+         * a bitrate.
+         */
+        val pcmBitrateKbps: Int?
+            get() {
+                val depth = bitDepth ?: return null
+                val rate = sampleRateHz ?: return null
+                val ch = channels ?: return null
+                return (depth.toLong() * rate * ch / 1000).toInt().takeIf { it > 0 }
+            }
+    }
+
+    /**
+     * What the renderer was handed, with the gaps its container left filled in
+     * from the stream's own header.
+     *
+     * A container is free not to state any of this, and one in use here
+     * doesn't: Tidal's FLAC arrives inside MP4, whose audio sample entry
+     * carries the sample rate as a 16.16 fixed-point field and is written
+     * zero, the escape the FLAC-in-ISOBMFF spec allows precisely because the
+     * real figure lives in the `dfLa` box below it. Media3 passes that box
+     * through as initialization data without folding it back into the
+     * `Format`, so `sampleRate` reached the stats line as 0 and `pcmEncoding`
+     * as unset — `audio/flac 0.0kHz ?-bit`, on a track that is plain
+     * 16-bit/44.1kHz and displayed as such everywhere else.
+     *
+     * Every figure here still comes from the bytes being decoded. This is not
+     * a fallback to what a source claimed; it is the same stream read at the
+     * one layer that always states it, because a FLAC frame cannot be decoded
+     * without it.
+     */
+    private fun Format.measure(): Measured {
+        val streamInfo = flacStreamInfo()
+        return Measured(
+            sampleRateHz = sampleRate.takeIf { it > 0 } ?: streamInfo?.sampleRateHz,
+            channels = channelCount.takeIf { it > 0 } ?: streamInfo?.channels,
+            // The renderer's PCM encoding first: it is the one that would show
+            // a 24-bit master being truncated on the way to the sink, which is
+            // the whole reason the figure is on screen. STREAMINFO describes
+            // the file, so it can only answer what the file holds.
+            bitDepth = bitDepthOf(pcmEncoding) ?: streamInfo?.bitDepth,
+        )
+    }
+
+    /** Sample rate, channel count and bit depth as a FLAC STREAMINFO block states them. */
+    private class FlacStreamInfo(val sampleRateHz: Int, val channels: Int, val bitDepth: Int)
+
+    /**
+     * The STREAMINFO block carried in this format's initialization data, for a
+     * FLAC stream that has one.
+     *
+     * The offset is found rather than assumed. Media3 hands the block over
+     * with a `fLaC` marker in front of it from both the MP4 and the raw path,
+     * but that is its business and not something worth depending on, so all
+     * three shapes — marker, bare block header, bare body — are recognised by
+     * looking for the header itself: a metadata block type of 0 (STREAMINFO)
+     * followed by a 24-bit length of 34.
+     */
+    private fun Format.flacStreamInfo(): FlacStreamInfo? {
+        if (sampleMimeType != MimeTypes.AUDIO_FLAC) return null
+        val data = initializationData.firstOrNull() ?: return null
+        fun byteAt(i: Int) = data[i].toInt() and 0xFF
+        fun headerAt(i: Int) = data.size > i + 3 &&
+            (byteAt(i) and 0x7F) == 0 &&
+            byteAt(i + 1) == 0 && byteAt(i + 2) == 0 && byteAt(i + 3) == STREAM_INFO_BYTES
+        val body = when {
+            data.size >= 4 && String(data, 0, 4, Charsets.US_ASCII) == "fLaC" ->
+                if (headerAt(4)) 8 else 4
+            headerAt(0) -> 4
+            else -> 0
+        }
+        if (data.size < body + STREAM_INFO_BYTES) return null
+        fun at(i: Int) = byteAt(body + i)
+        // STREAMINFO opens with two 16-bit block sizes and two 24-bit frame
+        // sizes — ten bytes — and then packs, without alignment, a 20-bit
+        // sample rate, a 3-bit channel count and a 5-bit sample depth, the
+        // last two both stored one less than they mean.
+        val sampleRate = (at(10) shl 12) or (at(11) shl 4) or (at(12) shr 4)
+        val channels = ((at(12) shr 1) and 0x07) + 1
+        val bitDepth = (((at(12) and 0x01) shl 4) or (at(13) shr 4)) + 1
+        return FlacStreamInfo(sampleRate, channels, bitDepth).takeIf { sampleRate > 0 }
+    }
+
+    /**
+     * Publishes what the decoder is really being fed, for "stats for nerds"
+     * and for the quality badge above it.
+     *
+     * Everything the badge is decided on is measured off the stream in hand —
+     * see [Measured] and [NerdStats.Snapshot.isLossless]. What a source said
+     * it was about to send is carried alongside as [NerdStats.Snapshot.claimed]
+     * and used for nothing but the mismatch note, because a claim is the one
+     * thing that stays true after the stream it described has stopped playing.
+     *
+     * Bitrate is the awkward one. A lossless stream gets the rate its samples
+     * decode to, which is a product of three figures already measured and is
+     * the number a listener can compare between tracks. A lossy one gets the
+     * container's, when the container states it — YouTube's WebM and MP4 do
+     * not, so [Format.bitrate] arrives as `NO_VALUE` and the honest figure is
+     * whatever named this stream instead. The source's own figure comes ahead
+     * of YouTube's because a track can have both: one resolved through YouTube
+     * and then upgraded to a module stream mid-song has a stale 160 sitting in
+     * [NerdStats.pickedBitrateKbps] describing audio that stopped playing
+     * several seconds ago. Anything still unknown is left null for the UI to
+     * omit — better a shorter line than a made-up number.
      */
     private fun publishNerdStats() {
         val player = player ?: return
         val format = player.audioFormat
         val mediaId = player.currentMediaItem?.mediaId
+        val measured = format?.measure()
         NerdStats.current.value = NerdStats.Snapshot(
             mimeType = format?.sampleMimeType,
-            bitrateKbps = format?.bitrate?.takeIf { it != Format.NO_VALUE }?.div(1000)
+            bitrateKbps = measured?.pcmBitrateKbps
+                ?.takeIf { NerdStats.isLosslessMime(format?.sampleMimeType) }
+                ?: format?.bitrate?.takeIf { it > 0 }?.div(1000)
                 ?: NerdStats.declaredFormat(mediaId)?.kbps
                 ?: NerdStats.pickedBitrateKbps(mediaId),
-            sampleRateHz = format?.sampleRate?.takeIf { it != Format.NO_VALUE },
-            channels = format?.channelCount?.takeIf { it != Format.NO_VALUE },
-            bitDepth = format?.pcmEncoding?.let(::bitDepthOf),
+            sampleRateHz = measured?.sampleRateHz,
+            channels = measured?.channels,
+            bitDepth = measured?.bitDepth,
             claimed = NerdStats.declaredFormat(mediaId),
         )
+    }
+
+    /** Serialize only the bounded window needed for a future cold-start resume. */
+    private fun saveQueueSnapshot(player: ExoPlayer) {
+        if (player.mediaItemCount == 0) {
+            persistedQueueStart = 0
+            LastPlayed.clear()
+            return
+        }
+        val range = LastPlayed.window(player.mediaItemCount, player.currentMediaItemIndex)
+        if (range.isEmpty()) return
+        persistedQueueStart = range.first
+        LastPlayed.saveQueue(
+            songs = range.map { player.getMediaItemAt(it).toSong() },
+            index = player.currentMediaItemIndex - range.first,
+        )
+        savePlaybackState(player)
+    }
+
+    /** Make the newly installed radio queue the durable cold-start boundary. */
+    private fun saveQueueSnapshotImmediately(player: ExoPlayer) {
+        if (player.mediaItemCount == 0) {
+            persistedQueueStart = 0
+            LastPlayed.clearImmediately()
+            return
+        }
+        val range = LastPlayed.window(player.mediaItemCount, player.currentMediaItemIndex)
+        persistedQueueStart = range.first
+        LastPlayed.saveQueueImmediately(
+            songs = (0 until player.mediaItemCount).map { player.getMediaItemAt(it).toSong() },
+            index = player.currentMediaItemIndex,
+            positionMs = player.currentPosition,
+        )
+    }
+
+    /** Drop every service-side reference that could resurrect the former queue. */
+    private fun beginRadioQueue() {
+        crossfade?.onSkipRequested()
+        autoplayLoadJob?.cancel()
+        autoplayLoadJob = null
+        autoplaySeed = null
+        repeatAllStash = emptyList()
+        repeatAllStashSeed = null
+        sessionSongHistory.clear()
+        persistedQueueStart = 0
+        LastPlayed.clearImmediately()
+    }
+
+    /** Persist index and position without touching or serializing queue contents. */
+    private fun savePlaybackState(player: ExoPlayer) {
+        if (player.mediaItemCount == 0) return
+        LastPlayed.savePlaybackState(
+            index = player.currentMediaItemIndex - persistedQueueStart,
+            positionMs = player.currentPosition,
+        )
+    }
+
+    /** Restore the bounded queue without preparing or resolving a stream. */
+    private fun restoreLastQueue(player: ExoPlayer): Boolean {
+        val last = LastPlayed.load() ?: return false
+        persistedQueueStart = 0
+        player.setMediaItems(last.songs.map { it.toMediaItem() }, last.index, last.positionMs)
+        return true
     }
 
     /**
@@ -2001,15 +3457,35 @@ class PlaybackService : MediaSessionService() {
         else -> null
     }
 
-    /** Snapshot the queue so the next launch can open where this one stopped. */
-    private fun saveQueue() {
-        val player = player ?: return
-        if (player.mediaItemCount == 0) return
-        LastPlayed.save(
-            songs = (0 until player.mediaItemCount).map { player.getMediaItemAt(it).toSong() },
-            index = player.currentMediaItemIndex,
-            positionMs = player.currentPosition,
+    /**
+     * Tell the home-screen widgets what is playing.
+     *
+     * Kept out of [saveQueue] even though every caller does both: that one also
+     * runs from the per-second sampler in [reportProgress], and pushing a bitmap
+     * to the launcher once a second would be a lot of work to redraw the same
+     * picture.
+     *
+     * [playing] overrides what the player reports, for the one caller that knows
+     * better than it does — teardown, where the player is still nominally set to
+     * play right up to the moment it is released.
+     */
+    private fun publishWidgetState(playing: Boolean? = null) {
+        val exoPlayer = player ?: return
+        val song = exoPlayer.currentMediaItem?.toSong() ?: return
+        MediaWidgetSnapshot.save(
+            this,
+            MediaWidgetSnapshot(
+                mediaId = song.videoId,
+                title = song.title,
+                artist = song.artist,
+                artworkUrl = song.thumbnailUrl,
+                // playWhenReady, not isPlaying — see MediaWidgetSnapshot.isPlaying.
+                isPlaying = playing ?: exoPlayer.playWhenReady,
+                hasPrevious = exoPlayer.hasPreviousMediaItem(),
+                hasNext = exoPlayer.hasNextMediaItem(),
+            ),
         )
+        MediaWidget.refresh(this)
     }
 
     /**
@@ -2018,13 +3494,25 @@ class PlaybackService : MediaSessionService() {
      */
     private fun prefetchAround(player: ExoPlayer) {
         val nextIndex = player.nextMediaItemIndex
-        val upcomingIds = if (nextIndex != C.INDEX_UNSET) {
+        val upcoming = if (nextIndex != C.INDEX_UNSET) {
             val end = (nextIndex + AudioCache.QUEUE_DEPTH - 1).coerceAtMost(player.mediaItemCount - 1)
-            (nextIndex..end).map { player.getMediaItemAt(it).mediaId }
+            (nextIndex..end).map { index ->
+                val item = player.getMediaItemAt(index)
+                // The title, artist and runtime the item was built with — see
+                // [Song.toMediaItem]. Read here, on the player's own thread,
+                // because read-ahead runs off the queue rather than off the
+                // session and has no other way to reach the track's metadata.
+                AudioCache.Upcoming(
+                    mediaId = item.mediaId,
+                    target = item.localConfiguration?.uri
+                        ?.let(SourceResolver::targetIn)
+                        ?: TrackMatcher.Target("", ""),
+                )
+            }
         } else {
             emptyList()
         }
-        AudioCache.prefetchQueue(upcomingIds)
+        AudioCache.prefetchQueue(upcoming)
     }
 
     /**
@@ -2046,9 +3534,17 @@ class PlaybackService : MediaSessionService() {
                     player.currentMediaItem?.mediaId?.let {
                         PlaybackTracker.onProgress(it, lastPositionSeconds)
                     }
-                    // Same cadence for the resume point: the process can be
-                    // killed at any moment without another callback arriving.
-                    saveQueue()
+                    // The device's own listening record — see [ListeningRecorder],
+                    // which counts wall-clock time between ticks rather than
+                    // reading the position. This loop is the only place in the app
+                    // that ticks exactly while audio is coming out, which is what
+                    // makes it the right place to count from.
+                    player.currentMediaItem?.toSong()?.let {
+                        ListeningRecorder.onSample(it, player.duration)
+                    }
+                    // Only two primitive preference values. Queue JSON is
+                    // written from onTimelineChanged, never from this loop.
+                    savePlaybackState(player)
                     // The renderer can settle on its format a moment after the
                     // track change, which no callback of ours follows up on.
                     publishNerdStats()
@@ -2152,6 +3648,36 @@ class PlaybackService : MediaSessionService() {
         spatial: SpatialAudioProcessor,
         transition: TransitionFilterProcessor,
     ) = object : DefaultRenderersFactory(this) {
+        init {
+            // Do not force PCM_FLOAT onto an OEM speaker mixer merely because
+            // the preference asks for it. The selected USB route must advertise
+            // the format; otherwise Media3 uses its stable PCM16 path.
+            setEnableAudioFloatOutput(configuredFloatOutput)
+            if (configuredFloatOutput) {
+                // c2.sec.flac.decoder produces one extra 232.2ms timestamp
+                // advance per decoded buffer when Media3 requests float PCM.
+                // Keep the real PCM_FLOAT sink, but decode FLAC through the
+                // platform software codec on affected Samsung devices.
+                setMediaCodecSelector { mimeType, requiresSecureDecoder, requiresTunnelingDecoder ->
+                    val selector = if (mimeType == MimeTypes.AUDIO_FLAC) {
+                        MediaCodecSelector.PREFER_SOFTWARE
+                    } else {
+                        MediaCodecSelector.DEFAULT
+                    }
+                    val candidates = selector.getDecoderInfos(
+                        mimeType,
+                        requiresSecureDecoder,
+                        requiresTunnelingDecoder,
+                    )
+                    if (mimeType == MimeTypes.AUDIO_FLAC) {
+                        candidates.filterNot { AudioOutputPolicy.isUnsafeFloatFlacDecoder(it.name) }
+                    } else {
+                        candidates
+                    }
+                }
+            }
+        }
+
         override fun buildAudioSink(
             context: Context,
             enableFloatOutput: Boolean,
@@ -2186,6 +3712,118 @@ class PlaybackService : MediaSessionService() {
     private fun applySettings(player: ExoPlayer) {
         player.skipSilenceEnabled = AppSettings.skipSilence.value
         player.setPlaybackSpeed(AppSettings.playbackSpeed.value)
+        // Restore persisted shuffle and repeat states on startup.
+        if (AppSettings.shuffleEnabled.value) {
+            QueueShuffle.setEnabled(true)
+        }
+        player.repeatMode = AppSettings.repeatMode.value
+    }
+
+    /**
+     * Applies the user's USB-DAC preference through the public Android routing
+     * API. This does not bypass the system USB driver: it intentionally lets
+     * Android negotiate only formats the connected DAC actually advertises.
+     */
+    private fun applyOutputRoute() {
+        val manager = audioManager ?: return
+        val usb = preferredUsbDevice()
+        val preferred = usb.takeIf { AppSettings.preferUsbDac.value }
+        eachPlayer { it.setPreferredAudioDevice(preferred) }
+        AudioOutputStatus.publish(
+            manager = manager,
+            requestedPcmMode = AppSettings.outputPcmMode.value,
+            preferred = preferred,
+            floatEnabled = shouldEnableFloatOutput(),
+        )
+    }
+
+    private fun requestOutputReconfiguration() {
+        outputReconfigureJob?.cancel()
+        outputReconfigureJob = scope.launch {
+            // Replacing two renderers during a blend would cut one half of it.
+            // Wait for the short transition to settle, then swap the engine.
+            while (crossfade?.isTransitioning() == true) delay(50)
+            val requestedFloat = shouldEnableFloatOutput()
+            if (requestedFloat == configuredFloatOutput) {
+                applyOutputRoute()
+            } else {
+                rebuildPlayersForOutput(requestedFloat)
+            }
+        }
+    }
+
+    /**
+     * Rebuilds Media3's immutable AudioSink configuration without restarting
+     * the app or service. Queue, item, position and play state are transferred
+     * to the replacement player; the old AudioTrack is released only after the
+     * MediaSession points at the new one.
+     */
+    private fun rebuildPlayersForOutput(enableFloat: Boolean) {
+        val oldActive = player ?: return
+        val oldSpare = spare ?: return
+        val items = List(oldActive.mediaItemCount) { oldActive.getMediaItemAt(it) }
+        val index = oldActive.currentMediaItemIndex.takeIf { it != C.INDEX_UNSET } ?: 0
+        val position = oldActive.currentPosition.coerceAtLeast(0L)
+        val playWhenReady = oldActive.playWhenReady
+        val repeatMode = oldActive.repeatMode
+        val shuffleMode = oldActive.shuffleModeEnabled
+
+        oldActive.playWhenReady = false
+        crossfade?.release()
+        oldActive.removeListener(playbackListener)
+        oldActive.removeAnalyticsListener(formatListener)
+
+        configuredFloatOutput = enableFloat
+        activeFilter = transitionFilterA
+        spareFilter = transitionFilterB
+        val newActive = buildPlayer(spatialAudioProcessorA, transitionFilterA, ownsSession = true)
+        val newSpare = buildPlayer(spatialAudioProcessorB, transitionFilterB, ownsSession = false)
+        player = newActive
+        spare = newSpare
+        newSpare.audioSessionId = newActive.audioSessionId
+        AppSettings.audioSessionId.value = newActive.audioSessionId
+        applySettings(newActive)
+        applySettings(newSpare)
+        newActive.repeatMode = repeatMode
+        newActive.shuffleModeEnabled = shuffleMode
+        if (items.isNotEmpty()) {
+            newActive.setMediaItems(items, index.coerceIn(items.indices), position)
+        }
+        newActive.addListener(playbackListener)
+        newActive.addAnalyticsListener(formatListener)
+
+        val newCrossfade = createCrossfadeController()
+        crossfade = newCrossfade
+        newCrossfade.start()
+        mediaSession?.player = SessionPlayer(newActive, newCrossfade) { lastPublishedSubtitle }
+        applyOutputRoute()
+        if (items.isNotEmpty()) newActive.prepare()
+        newActive.playWhenReady = playWhenReady
+
+        oldActive.release()
+        oldSpare.release()
+        TrackLog.i(
+            "AUDIO_OUT",
+            "live output switch: ${if (enableFloat) "PCM_FLOAT" else "PCM_16BIT"}",
+            about = newActive.currentMediaItem?.mediaId,
+        )
+    }
+
+    private fun preferredUsbDevice(): AudioDeviceInfo? = audioManager
+        ?.getDevices(AudioManager.GET_DEVICES_OUTPUTS)
+        ?.firstOrNull { device ->
+            device.type == AudioDeviceInfo.TYPE_USB_DEVICE ||
+                device.type == AudioDeviceInfo.TYPE_USB_HEADSET ||
+                device.type == AudioDeviceInfo.TYPE_USB_ACCESSORY
+        }
+
+    private fun shouldEnableFloatOutput(): Boolean {
+        val usb = preferredUsbDevice()
+        return AudioOutputPolicy.shouldUseFloatOutput(
+            requestedMode = AppSettings.outputPcmMode.value,
+            isPreferredUsbRoute = AppSettings.preferUsbDac.value && usb != null,
+            advertisesPcmFloat = usb?.encodings?.contains(AudioFormat.ENCODING_PCM_FLOAT) == true,
+        )
     }
 
     /** Runs [body] against both players, in whichever roles they currently hold. */
@@ -2199,6 +3837,12 @@ class PlaybackService : MediaSessionService() {
             AppSettings.skipSilence.collect { on -> eachPlayer { it.skipSilenceEnabled = on } }
         }
         scope.launch {
+            AppSettings.preferUsbDac.drop(1).collect { requestOutputReconfiguration() }
+        }
+        scope.launch {
+            AppSettings.outputPcmMode.drop(1).collect { requestOutputReconfiguration() }
+        }
+        scope.launch {
             // Not applied to a player mid-transition: [CrossfadeController]
             // stacks a beatmatch stretch on top of this setting, and writing the
             // raw value over it would drop the incoming track back to its own
@@ -2209,24 +3853,39 @@ class PlaybackService : MediaSessionService() {
                 eachPlayer { it.setPlaybackSpeed(speed) }
             }
         }
-        // Spatial audio is the user's switch *and* the device's: Atmos going
-        // off in system settings mid-track has to stop the effect, not wait for
-        // the next track or the next launch.
         scope.launch {
             combine(
-                AppSettings.spatialAudio,
-                DolbyAtmos.supported,
-                DolbyAtmos.enabledOnDevice,
-            ) { wanted, supported, atmosOn -> wanted && supported && atmosOn }
-                .collect {
-                    spatialAudioProcessorA.enabled = it
-                    spatialAudioProcessorB.enabled = it
-                }
+                AppSettings.syncedLyrics,
+                AppSettings.lyricsSources,
+                AppSettings.lyricsSourceOrder,
+                AppSettings.prioritizeSyllableSync,
+            ) { synced, sources, order, prio ->
+                synced to sources
+            }.distinctUntilChanged().collect {
+                loadLyricsForCurrentTrack()
+            }
+        }
+        scope.launch {
+            AppSettings.spatialAudio.collect { applySpatialAudioEnabled() }
         }
     }
 
+    /**
+     * The effective spatial-audio state: the user's toggle, unless the
+     * active player's decoder is currently on a Dolby Atmos (E-AC-3 JOC)
+     * stream, in which case it's forced off. [activeTrackIsDolbyAtmos] only
+     * ever describes the active player — see [formatListener] — so both
+     * processors are kept in lockstep rather than tracking a role swap.
+     */
+    private fun applySpatialAudioEnabled() {
+        val enabled = AppSettings.spatialAudio.value && !activeTrackIsDolbyAtmos
+        spatialAudioProcessorA.enabled = enabled
+        spatialAudioProcessorB.enabled = enabled
+    }
+
     private fun observeScrobbling() {
-        // Rebuild the ScrobbleManager whenever scrobbling settings change.
+        // Keep the manager alive while its timing settings change, so updating
+        // a preference does not cancel the current track's scrobble timer.
         scope.launch {
             // Explicit <Any, _>: these flows have mixed element types, and letting
             // the reified vararg combine() infer T lands on an intersection type.
@@ -2234,6 +3893,7 @@ class PlaybackService : MediaSessionService() {
                 AppSettings.lastfmEnabled,
                 AppSettings.lastfmScrobbleEnabled,
                 AppSettings.lastfmNowPlaying,
+                AppSettings.lastfmPrimaryArtistOnly,
                 AppSettings.lastfmSessionKey,
                 AppSettings.lastfmApiKey,
                 AppSettings.lastfmSecret,
@@ -2246,39 +3906,51 @@ class PlaybackService : MediaSessionService() {
                     lastfmEnabled = values[0] as Boolean,
                     scrobbleEnabled = values[1] as Boolean,
                     nowPlaying = values[2] as Boolean,
-                    sessionKey = values[3] as String,
-                    apiKey = values[4] as String,
-                    secret = values[5] as String,
-                    endpoint = values[6] as String,
-                    minDuration = values[7] as Int,
-                    delayPercent = values[8] as Float,
-                    delaySeconds = values[9] as Int,
+                    primaryArtistOnly = values[3] as Boolean,
+                    sessionKey = values[4] as String,
+                    apiKey = values[5] as String,
+                    secret = values[6] as String,
+                    endpoint = values[7] as String,
+                    minDuration = values[8] as Int,
+                    delayPercent = values[9] as Float,
+                    delaySeconds = values[10] as Int,
                 )
             }.collectLatest { snapshot ->
-                scrobbleManager?.destroy()
-                scrobbleManager = null
-
-                if (AppSettings.scrobblingAvailable &&
+                val shouldEnable = AppSettings.scrobblingAvailable &&
                     snapshot.lastfmEnabled &&
-                    snapshot.sessionKey.isNotBlank()
-                ) {
-                    // Configure LastFM client
-                    val endpoint = snapshot.endpoint.ifBlank { LastFM.DEFAULT_API_ENDPOINT }
-                    val apiKey = snapshot.apiKey.ifBlank { LastFM.FALLBACK_COMPAT_API_KEY }
-                    val secret = snapshot.secret.ifBlank { LastFM.FALLBACK_COMPAT_SECRET }
-                    LastFM.configure(
-                        endpoint = endpoint,
-                        apiKey = apiKey,
-                        secret = secret,
-                        sessionKey = snapshot.sessionKey,
-                    )
-                    scrobbleManager = ScrobbleManager(
-                        scope = scope,
-                        minSongDuration = snapshot.minDuration,
-                        scrobbleDelayPercent = snapshot.delayPercent,
-                        scrobbleDelaySeconds = snapshot.delaySeconds,
-                    ).apply {
-                        useNowPlaying = snapshot.nowPlaying
+                    snapshot.scrobbleEnabled &&
+                    snapshot.sessionKey.isNotBlank() &&
+                    snapshot.apiKey.isNotBlank() &&
+                    snapshot.secret.isNotBlank()
+
+                if (!shouldEnable) {
+                    scrobbleManager?.destroy()
+                    scrobbleManager = null
+                    return@collectLatest
+                }
+
+                LastFM.configure(
+                    endpoint = snapshot.endpoint.ifBlank { LastFM.DEFAULT_API_ENDPOINT },
+                    apiKey = snapshot.apiKey,
+                    secret = snapshot.secret,
+                    sessionKey = snapshot.sessionKey,
+                )
+                val manager = scrobbleManager ?: ScrobbleManager(scope).also {
+                    scrobbleManager = it
+                }
+                manager.minSongDuration = snapshot.minDuration
+                manager.scrobbleDelayPercent = snapshot.delayPercent
+                manager.scrobbleDelaySeconds = snapshot.delaySeconds
+                manager.useNowPlaying = snapshot.nowPlaying
+                manager.usePrimaryArtistOnly = snapshot.primaryArtistOnly
+
+                player?.let { exoPlayer ->
+                    if (exoPlayer.isPlaying) {
+                        manager.onPlayerStateChanged(
+                            isPlaying = true,
+                            song = exoPlayer.currentMediaItem?.toSong(),
+                            durationMs = exoPlayer.duration.takeIf { it > 0 },
+                        )
                     }
                 }
             }
@@ -2289,6 +3961,7 @@ class PlaybackService : MediaSessionService() {
         val lastfmEnabled: Boolean,
         val scrobbleEnabled: Boolean,
         val nowPlaying: Boolean,
+        val primaryArtistOnly: Boolean,
         val sessionKey: String,
         val apiKey: String,
         val secret: String,
@@ -2476,7 +4149,7 @@ class PlaybackService : MediaSessionService() {
         if (!lbEnabled || lbToken.isBlank()) return
         val endMs = System.currentTimeMillis()
         scope.launch {
-            ListenBrainzManager.submitFinished(lbToken, song, startMs, endMs, durationMs)
+            ListenBrainzManager.submitFinished(lbToken, song, startMs, endMs, durationMs, AppSettings.listenBrainzPrimaryArtistOnly.value)
         }
     }
 
@@ -2486,11 +4159,11 @@ class PlaybackService : MediaSessionService() {
         val lbToken = AppSettings.listenBrainzToken.value
         if (!lbEnabled || lbToken.isBlank()) return
         scope.launch {
-            ListenBrainzManager.submitPlayingNow(lbToken, song, positionMs, durationMs)
+            ListenBrainzManager.submitPlayingNow(lbToken, song, positionMs, durationMs, AppSettings.listenBrainzPrimaryArtistOnly.value)
         }
     }
 
-    override fun onGetSession(controllerInfo: MediaSession.ControllerInfo): MediaSession? =
+    override fun onGetSession(controllerInfo: MediaSession.ControllerInfo): MediaLibrarySession? =
         mediaSession
 
     /**
@@ -2514,17 +4187,33 @@ class PlaybackService : MediaSessionService() {
 
 
     override fun onDestroy() {
-        // Last chance to record the resume point, while the player still exists.
-        saveQueue()
+        audioManager?.unregisterAudioDeviceCallback(outputDeviceCallback)
+        player?.let(::savePlaybackState)
+        // And to leave the widgets showing a play button. Nothing else reports a
+        // swipe-away, so a widget left on the home screen would sit there with a
+        // pause glyph on a service that no longer exists.
+        publishWidgetState(playing = false)
+        lyricsTickerJob?.cancel()
+        lyricsTickerJob = null
+        serviceLyricsJob?.cancel()
+        serviceLyricsJob = null
+        serviceLyrics = null
         AudioCache.cancel()
         trackAnalyzer.release()
+        // The YouTube Music history entry for whatever was playing, closed out
+        // on the same terms as the ListenBrainz submit below: a swipe-away never
+        // fires STATE_ENDED, and the tracker's own scope outlives this service,
+        // so the ping still goes out after the service scope is cancelled.
+        PlaybackTracker.onPlaybackFinished(
+            player?.currentPosition?.div(1000) ?: lastPositionSeconds,
+        )
         // Also the last chance to close out the track that was playing — a
         // swipe-away or stop never fires STATE_ENDED, so the session would
         // otherwise end with an un-scrobbled song. This must not ride on the
         // service scope: it is cancelled a few lines down, and the request
         // should still reach ListenBrainz.
         val lastSong = listenBrainzSong
-        if (lastSong != null) {
+        if (lastSong != null && listenBrainzStartMs > 0L) {
             val lbEnabled =
                 AppSettings.scrobblingAvailable && AppSettings.listenBrainzEnabled.value
             val lbToken = AppSettings.listenBrainzToken.value
@@ -2534,12 +4223,16 @@ class PlaybackService : MediaSessionService() {
                 CoroutineScope(Dispatchers.IO).launch {
                     ListenBrainzManager.submitFinished(
                         lbToken, lastSong, lastStart, System.currentTimeMillis(), lastDuration,
+                        AppSettings.listenBrainzPrimaryArtistOnly.value,
                     )
                 }
             }
         }
         scrobbleManager?.destroy()
         scrobbleManager = null
+        // Last chance to get the current track's minutes onto disk: the scope is
+        // cancelled a few lines down and the sampler goes with it.
+        ListeningRecorder.onStopped()
         // Discord, on the same terms as the ListenBrainz submit above: the
         // service scope is cancelled a few lines down, and a presence left up
         // would advertise a track that stopped when the process did — until
@@ -2572,6 +4265,99 @@ class PlaybackService : MediaSessionService() {
         super.onDestroy()
     }
 
+    private fun loadLyricsForCurrentTrack() {
+        val currentSong = player?.currentMediaItem?.toSong() ?: run {
+            serviceLyrics = null
+            stopLyricsTicker()
+            return
+        }
+
+        if (!AppSettings.syncedLyrics.value) {
+            serviceLyrics = null
+            stopLyricsTicker()
+            return
+        }
+
+        val trackDurationMs = (player?.duration ?: 0L).takeIf { it > 0 } ?: 0L
+
+        serviceLyricsJob?.cancel()
+        serviceLyricsJob = scope.launch(Dispatchers.IO) {
+            val localUri = currentSong.localUri
+            var lines: List<LyricLine>? = null
+            if (localUri != null) {
+                lines = EmbeddedLyrics.forUri(this@PlaybackService, localUri)
+            }
+            if (lines == null) {
+                val found = LyricsRepository.lyrics(
+                    videoId = currentSong.videoId,
+                    title = currentSong.title,
+                    artist = currentSong.artist,
+                    durationMs = trackDurationMs,
+                    album = currentSong.albumName,
+                    sources = AppSettings.lyricsSources.value,
+                    order = AppSettings.lyricsSourceOrder.value,
+                    prioritizeSyllableSync = AppSettings.prioritizeSyllableSync.value,
+                )
+                lines = found?.lines
+            }
+            withContext(Dispatchers.Main) {
+                serviceLyrics = lines
+                if (player?.isPlaying == true) {
+                    updateLyricSubtitle()
+                }
+            }
+        }
+    }
+
+    private fun startLyricsTicker() {
+        if (lyricsTickerJob?.isActive == true) return
+        lyricsTickerJob = scope.launch(Dispatchers.Main) {
+            while (isActive) {
+                updateLyricSubtitle()
+                delay(500L)
+            }
+        }
+    }
+
+    private fun stopLyricsTicker() {
+        lyricsTickerJob?.cancel()
+        lyricsTickerJob = null
+        updateLyricSubtitle()
+    }
+
+    private fun updateLyricSubtitle() {
+        val exoPlayer = player ?: return
+        val currentSong = exoPlayer.currentMediaItem?.toSong() ?: return
+        val lines = serviceLyrics
+        val pos = exoPlayer.currentPosition
+        val subtitleText = if (lines != null && lines.isNotEmpty() && AppSettings.syncedLyrics.value) {
+            val idx = lines.indexOfLast { it.timeMs <= pos }
+            val currentLine = lines.getOrNull(idx)
+            if (currentLine != null && !currentLine.isGap && currentLine.text.isNotBlank()) {
+                "♪ ${currentLine.text}"
+            } else {
+                currentSong.artist
+            }
+        } else {
+            currentSong.artist
+        }
+
+        if (subtitleText != lastPublishedSubtitle) {
+            lastPublishedSubtitle = subtitleText
+            val metadata = MediaMetadata.Builder()
+                .setTitle(currentSong.title)
+                .setArtist(currentSong.artist)
+                .setSubtitle(subtitleText)
+                .setAlbumTitle(currentSong.albumName)
+                .setArtworkUri(currentSong.artworkAt(NOTIFICATION_ART_PX)?.toUri())
+                .setMediaType(MediaMetadata.MEDIA_TYPE_MUSIC)
+                .setIsPlayable(true)
+                .setIsBrowsable(false)
+                .build()
+            exoPlayer.playlistMetadata = metadata
+        }
+    }
+
     /**
      * What the MediaSession, and so every control surface, actually talks to.
      *
@@ -2602,7 +4388,34 @@ class PlaybackService : MediaSessionService() {
     private class SessionPlayer(
         player: Player,
         private val crossfade: CrossfadeController,
+        private val getSubtitle: () -> String?,
     ) : ForwardingPlayer(player) {
+
+        override fun getMediaMetadata(): MediaMetadata {
+            val base = wrappedPlayer.mediaMetadata
+            val subtitle = getSubtitle()
+            return if (!subtitle.isNullOrBlank()) {
+                base.buildUpon().setSubtitle(subtitle).build()
+            } else {
+                base
+            }
+        }
+
+        override fun seekTo(mediaItemIndex: Int, positionMs: Long) {
+            crossfade.onSkipRequested()
+            val skipped = skippedByQueueJump(currentMediaItemIndex, mediaItemIndex)
+            if (skipped == null) {
+                wrappedPlayer.seekTo(mediaItemIndex, positionMs)
+                return
+            }
+
+            // A direct choice of a later queue row bypasses every item between
+            // here and there. Remove those unplayed rows before seeking so they
+            // do not masquerade as listening history. The selected item's new
+            // index is the first removed slot.
+            wrappedPlayer.removeMediaItems(skipped.first, skipped.last + 1)
+            wrappedPlayer.seekTo(skipped.first, positionMs)
+        }
 
         override fun seekToPreviousMediaItem() {
             crossfade.onSkipRequested()
@@ -2620,7 +4433,708 @@ class PlaybackService : MediaSessionService() {
         }
     }
 
+    /**
+     * Handles browsing and content resolution for Android Auto and other MediaBrowser clients.
+     */
+    private inner class MediaLibraryCallback : MediaLibrarySession.Callback {
+
+        override fun onConnect(
+            session: MediaSession,
+            controller: MediaSession.ControllerInfo,
+        ): MediaSession.ConnectionResult {
+            val sessionCommands = MediaSession.ConnectionResult.DEFAULT_SESSION_AND_LIBRARY_COMMANDS
+                .buildUpon()
+                .add(favoriteCommand)
+                .add(autoplayCommand)
+                .add(shuffleCommand)
+                .add(beginRadioQueueCommand)
+                .add(commitRadioQueueCommand)
+                .add(upgradeQualityCommand)
+                .build()
+            return MediaSession.ConnectionResult.AcceptedResultBuilder(session)
+                .setAvailablePlayerCommands(MediaSession.ConnectionResult.DEFAULT_PLAYER_COMMANDS)
+                .setAvailableSessionCommands(sessionCommands)
+                .build()
+        }
+
+        override fun onCustomCommand(
+            session: MediaSession,
+            controller: MediaSession.ControllerInfo,
+            customCommand: SessionCommand,
+            args: Bundle,
+        ): ListenableFuture<SessionResult> {
+            when (customCommand.customAction) {
+                ACTION_TOGGLE_AUTOPLAY -> toggleAutoplayFromNotification()
+                ACTION_TOGGLE_SHUFFLE -> toggleShuffleFromNotification()
+                ACTION_BEGIN_RADIO_QUEUE -> beginRadioQueue()
+                ACTION_COMMIT_RADIO_QUEUE -> player?.let(::saveQueueSnapshotImmediately)
+                ACTION_UPGRADE_QUALITY -> upgradeQualityNow()
+                ACTION_TOGGLE_FAVORITE -> session.player.currentMediaItem?.mediaId?.let {
+                    toggleFavoriteFromNotification(it)
+                }
+                else -> return Futures.immediateFuture(
+                    SessionResult(SessionError.ERROR_NOT_SUPPORTED),
+                )
+            }
+            // The actual YouTube rating is asynchronous. The command itself has been accepted;
+            // the notification is refreshed when the network write completes.
+            return Futures.immediateFuture(SessionResult(SessionResult.RESULT_SUCCESS))
+        }
+
+        override fun onGetLibraryRoot(
+            session: MediaLibrarySession,
+            browser: MediaSession.ControllerInfo,
+            params: LibraryParams?,
+        ): ListenableFuture<LibraryResult<MediaItem>> {
+            val isRecent = params?.isRecent == true ||
+                params?.extras?.getBoolean("android.service.media.extra.RECENT") == true ||
+                params?.extras?.getBoolean("androidx.media.MediaBrowserCompat.EXTRA_RECENT") == true
+
+            val rootId = if (isRecent) MEDIA_RECENTS_ID else MEDIA_ROOT_ID
+            val rootExtras = Bundle().apply {
+                putBoolean(EXTRA_CONTENT_STYLE_SUPPORTED, true)
+                putBoolean(EXTRA_CONTENT_STYLE_SUPPORTED_AX, true)
+                putInt(EXTRA_CONTENT_STYLE_BROWSABLE_HINT, CONTENT_STYLE_GRID_ITEM_HINT_VALUE)
+                putInt(EXTRA_CONTENT_STYLE_PLAYABLE_HINT, CONTENT_STYLE_GRID_ITEM_HINT_VALUE)
+                putInt(EXTRA_CONTENT_STYLE_BROWSABLE_HINT_AX, CONTENT_STYLE_GRID_ITEM_HINT_VALUE)
+                putInt(EXTRA_CONTENT_STYLE_PLAYABLE_HINT_AX, CONTENT_STYLE_GRID_ITEM_HINT_VALUE)
+                putInt(EXTRA_CONTENT_STYLE_BROWSABLE_HINT_LEGACY, CONTENT_STYLE_GRID_ITEM_HINT_VALUE)
+                putInt(EXTRA_CONTENT_STYLE_PLAYABLE_HINT_LEGACY, CONTENT_STYLE_GRID_ITEM_HINT_VALUE)
+                putInt("android.media.extras.CONTENT_STYLE_BROWSABLE_HINT", CONTENT_STYLE_GRID_ITEM_HINT_VALUE)
+                putInt("android.media.extras.CONTENT_STYLE_PLAYABLE_HINT", CONTENT_STYLE_GRID_ITEM_HINT_VALUE)
+                putInt("android.media.browse.CONTENT_STYLE_BROWSABLE_HINT", CONTENT_STYLE_GRID_ITEM_HINT_VALUE)
+                putInt("android.media.browse.CONTENT_STYLE_PLAYABLE_HINT", CONTENT_STYLE_GRID_ITEM_HINT_VALUE)
+            }
+            val rootItem = MediaItem.Builder()
+                .setMediaId(rootId)
+                .setMediaMetadata(
+                    MediaMetadata.Builder()
+                        .setTitle(getString(R.string.app_name))
+                        .setIsBrowsable(true)
+                        .setIsPlayable(false)
+                        .setFolderType(MediaMetadata.FOLDER_TYPE_MIXED)
+                        .setExtras(rootExtras)
+                        .build(),
+                )
+                .build()
+            val rootParams = LibraryParams.Builder()
+                .setExtras(rootExtras)
+                .build()
+            scope.launch(Dispatchers.IO) {
+                try {
+                    cachedHomeFeed()
+                } catch (_: Exception) {}
+            }
+
+            return Futures.immediateFuture(LibraryResult.ofItem(rootItem, rootParams))
+        }
+
+        override fun onGetChildren(
+            session: MediaLibrarySession,
+            browser: MediaSession.ControllerInfo,
+            parentId: String,
+            page: Int,
+            pageSize: Int,
+            params: LibraryParams?,
+        ): ListenableFuture<LibraryResult<ImmutableList<MediaItem>>> = scope.future(Dispatchers.IO) {
+            val isGridFolder = parentId == MEDIA_RECENTS_ID || parentId == MEDIA_QUICK_PICKS_ID
+            val items: List<MediaItem> = when (parentId) {
+                MEDIA_ROOT_ID -> listOf(
+                    createFolderItem(MEDIA_RECENTS_ID, "Recents", folderType = MediaMetadata.FOLDER_TYPE_ALBUMS, isGrid = true),
+                    createFolderItem(MEDIA_QUICK_PICKS_ID, "Quick Picks", folderType = MediaMetadata.FOLDER_TYPE_ALBUMS, isGrid = true),
+                    createFolderItem(MEDIA_PLAYLISTS_ID, "Playlists", folderType = MediaMetadata.FOLDER_TYPE_PLAYLISTS),
+                    createFolderItem(MEDIA_MORE_ID, "More", folderType = MediaMetadata.FOLDER_TYPE_MIXED),
+                )
+                MEDIA_MORE_ID -> listOf(
+                    createFolderItem(MEDIA_LIKED_ID, "Liked Music", folderType = MediaMetadata.FOLDER_TYPE_PLAYLISTS),
+                    createFolderItem(MEDIA_DOWNLOADS_ID, "Downloads", folderType = MediaMetadata.FOLDER_TYPE_MIXED),
+                    createFolderItem(MEDIA_LOCAL_MUSIC_ID, "Local Music", folderType = MediaMetadata.FOLDER_TYPE_MIXED),
+                )
+                MEDIA_RECENTS_ID -> {
+                    val songs = cachedRecentsSongs()
+                    val resultItems = if (songs.isNotEmpty()) {
+                        songs.map { it.toMediaItem().withGridStyle() }
+                    } else if (com.music.bitchord.data.innertube.Innertube.cookie == null) {
+                        listOf(createLoginPromptItem().withGridStyle())
+                    } else {
+                        emptyList()
+                    }
+                    resultItems
+                }
+                MEDIA_QUICK_PICKS_ID -> {
+                    val songs = cachedQuickPicksSongs()
+                    val resultItems = if (songs.isNotEmpty()) {
+                        songs.map { it.toMediaItem().withGridStyle() }
+                    } else {
+                        val home = cachedHomeFeed()
+                        val qpItems = home?.shelves?.flatMap { it.items }?.mapNotNull { it.toMediaItemOrNull() }
+                        if (!qpItems.isNullOrEmpty()) {
+                            qpItems.map { it.withGridStyle() }
+                        } else if (com.music.bitchord.data.innertube.Innertube.cookie == null) {
+                            listOf(createLoginPromptItem().withGridStyle())
+                        } else {
+                            emptyList()
+                        }
+                    }
+                    resultItems
+                }
+                MEDIA_LIKED_ID -> {
+                    if (com.music.bitchord.data.innertube.Innertube.cookie == null) {
+                        listOf(createLoginPromptItem())
+                    } else {
+                        val songs = cachedLikedSongs()
+                        if (songs.isNotEmpty()) {
+                            songs.map { it.toMediaItem() }
+                        } else {
+                            listOf(createLoginPromptItem())
+                        }
+                    }
+                }
+                MEDIA_DOWNLOADS_ID -> {
+                    val downloaded = Downloads.getDownloadedSongs(this@PlaybackService)
+                    downloaded.forEach { songCache[it.videoId] = it }
+                    downloaded.map { it.toMediaItem() }
+                }
+                MEDIA_PLAYLISTS_ID -> {
+                    val playlists = try {
+                        withTimeoutOrNull(3000L) {
+                            YtMusicRepository.libraryPlaylists().getOrNull()
+                                ?: YtMusicRepository.userPlaylists().getOrNull()?.map {
+                                    ShelfItem(
+                                        title = it.title,
+                                        subtitle = it.subtitle,
+                                        thumbnailUrl = it.thumbnailUrl,
+                                        videoId = null,
+                                        browseId = "VL${it.playlistId}",
+                                    )
+                                }
+                        } ?: emptyList()
+                    } catch (_: Exception) {
+                        emptyList()
+                    }
+                    playlists.map { playlist ->
+                        val browseId = playlist.browseId ?: "VL${playlist.videoId}"
+                        val mediaId = if (browseId.startsWith("VL")) "playlist:${browseId.removePrefix("VL")}" else "browse:$browseId"
+                        MediaItem.Builder()
+                            .setMediaId(mediaId)
+                            .setMediaMetadata(
+                                MediaMetadata.Builder()
+                                    .setTitle(playlist.title)
+                                    .setSubtitle(playlist.subtitle)
+                                    .setArtworkUri(playlist.thumbnailUrl?.artworkAt(NOTIFICATION_ART_PX)?.let { Uri.parse(it) })
+                                    .setIsBrowsable(true)
+                                    .setIsPlayable(true)
+                                    .setFolderType(MediaMetadata.FOLDER_TYPE_PLAYLISTS)
+                                    .build(),
+                            )
+                            .build()
+                    }
+                }
+                MEDIA_LOCAL_MUSIC_ID -> {
+                    val local = LocalMediaRepository.getLocalMusic(this@PlaybackService)
+                    local.forEach { songCache[it.videoId] = it }
+                    local.map { it.toMediaItem() }
+                }
+                else -> {
+                    when {
+                        parentId.startsWith("playlist:") -> {
+                            val playlistId = parentId.removePrefix("playlist:")
+                            val songs = try {
+                                withTimeoutOrNull(2500L) {
+                                    YtMusicRepository.browseSongs("VL$playlistId").getOrNull()?.songs
+                                        ?: YtMusicRepository.browseSongs(playlistId).getOrNull()?.songs
+                                } ?: emptyList()
+                            } catch (_: Exception) {
+                                emptyList()
+                            }
+                            songs.forEach { songCache[it.videoId] = it }
+                            songs.map { it.toMediaItem() }
+                        }
+                        parentId.startsWith("browse:") -> {
+                            val browseId = parentId.removePrefix("browse:")
+                            val songs = try {
+                                withTimeoutOrNull(2500L) {
+                                    YtMusicRepository.browseSongs(browseId).getOrNull()?.songs
+                                } ?: emptyList()
+                            } catch (_: Exception) {
+                                emptyList()
+                            }
+                            songs.forEach { songCache[it.videoId] = it }
+                            songs.map { it.toMediaItem() }
+                        }
+                        else -> {
+                            val cachedSong = songCache[parentId]
+                            if (cachedSong != null) {
+                                listOf(cachedSong.toMediaItem())
+                            } else {
+                                emptyList()
+                            }
+                        }
+                    }
+                }
+            }
+            val returnParams = if (isGridFolder) {
+                LibraryParams.Builder().setExtras(Bundle().apply {
+                    putInt(EXTRA_CONTENT_STYLE_BROWSABLE_HINT, CONTENT_STYLE_GRID_ITEM_HINT_VALUE)
+                    putInt(EXTRA_CONTENT_STYLE_PLAYABLE_HINT, CONTENT_STYLE_GRID_ITEM_HINT_VALUE)
+                    putInt(EXTRA_CONTENT_STYLE_BROWSABLE_HINT_AX, CONTENT_STYLE_GRID_ITEM_HINT_VALUE)
+                    putInt(EXTRA_CONTENT_STYLE_PLAYABLE_HINT_AX, CONTENT_STYLE_GRID_ITEM_HINT_VALUE)
+                    putInt(EXTRA_CONTENT_STYLE_BROWSABLE_HINT_LEGACY, CONTENT_STYLE_GRID_ITEM_HINT_VALUE)
+                    putInt(EXTRA_CONTENT_STYLE_PLAYABLE_HINT_LEGACY, CONTENT_STYLE_GRID_ITEM_HINT_VALUE)
+                    putInt("android.media.extras.CONTENT_STYLE_BROWSABLE_HINT", CONTENT_STYLE_GRID_ITEM_HINT_VALUE)
+                    putInt("android.media.extras.CONTENT_STYLE_PLAYABLE_HINT", CONTENT_STYLE_GRID_ITEM_HINT_VALUE)
+                    putInt("android.media.browse.CONTENT_STYLE_BROWSABLE_HINT", CONTENT_STYLE_GRID_ITEM_HINT_VALUE)
+                    putInt("android.media.browse.CONTENT_STYLE_PLAYABLE_HINT", CONTENT_STYLE_GRID_ITEM_HINT_VALUE)
+                    putBoolean(EXTRA_CONTENT_STYLE_SUPPORTED, true)
+                    putBoolean(EXTRA_CONTENT_STYLE_SUPPORTED_AX, true)
+                }).build()
+            } else {
+                params
+            }
+            LibraryResult.ofItemList(ImmutableList.copyOf(items), returnParams)
+        }
+
+        override fun onGetItem(
+            session: MediaLibrarySession,
+            browser: MediaSession.ControllerInfo,
+            mediaId: String,
+        ): ListenableFuture<LibraryResult<MediaItem>> = scope.future(Dispatchers.IO) {
+            val item = when (mediaId) {
+                MEDIA_ROOT_ID -> MediaItem.Builder()
+                    .setMediaId(MEDIA_ROOT_ID)
+                    .setMediaMetadata(
+                        MediaMetadata.Builder()
+                            .setTitle(getString(R.string.app_name))
+                            .setIsBrowsable(true)
+                            .setIsPlayable(false)
+                            .setFolderType(MediaMetadata.FOLDER_TYPE_MIXED)
+                            .build(),
+                    ).build()
+                MEDIA_RECENTS_ID -> createFolderItem(MEDIA_RECENTS_ID, "Recents", folderType = MediaMetadata.FOLDER_TYPE_ALBUMS, isGrid = true)
+                MEDIA_QUICK_PICKS_ID -> createFolderItem(MEDIA_QUICK_PICKS_ID, "Quick Picks", folderType = MediaMetadata.FOLDER_TYPE_ALBUMS, isGrid = true)
+                MEDIA_PLAYLISTS_ID -> createFolderItem(MEDIA_PLAYLISTS_ID, "Playlists", folderType = MediaMetadata.FOLDER_TYPE_PLAYLISTS)
+                MEDIA_MORE_ID -> createFolderItem(MEDIA_MORE_ID, "More", folderType = MediaMetadata.FOLDER_TYPE_MIXED)
+                MEDIA_LIKED_ID -> createFolderItem(MEDIA_LIKED_ID, "Liked Music", folderType = MediaMetadata.FOLDER_TYPE_PLAYLISTS)
+                MEDIA_DOWNLOADS_ID -> createFolderItem(MEDIA_DOWNLOADS_ID, "Downloads")
+                MEDIA_LOCAL_MUSIC_ID -> createFolderItem(MEDIA_LOCAL_MUSIC_ID, "Local Music")
+                "msg:login_required" -> createLoginPromptItem()
+                else -> {
+                    if (mediaId.startsWith("msg:")) {
+                        createLoginPromptItem()
+                    } else {
+                        val cached = songCache[mediaId]
+                        if (cached != null) {
+                            cached.toMediaItem()
+                        } else if (mediaId.startsWith("playlist:") || mediaId.startsWith("browse:")) {
+                            MediaItem.Builder()
+                                .setMediaId(mediaId)
+                                .setMediaMetadata(
+                                    MediaMetadata.Builder()
+                                        .setTitle("Playlist")
+                                        .setIsBrowsable(true)
+                                        .setIsPlayable(true)
+                                        .setFolderType(MediaMetadata.FOLDER_TYPE_PLAYLISTS)
+                                        .build(),
+                                ).build()
+                        } else {
+                            Song(videoId = mediaId, title = "Track", artist = "Artist", thumbnailUrl = null).toMediaItem()
+                        }
+                    }
+                }
+            }
+            LibraryResult.ofItem(item, null)
+        }
+
+        override fun onPlaybackResumption(
+            mediaSession: MediaSession,
+            controller: MediaSession.ControllerInfo,
+        ): ListenableFuture<MediaSession.MediaItemsWithStartPosition> = scope.future(Dispatchers.IO) {
+            // 1. If player currently holds items in its queue, resume from it
+            val activePlayer = player
+            if (activePlayer != null && activePlayer.mediaItemCount > 0) {
+                val currentItems = (0 until activePlayer.mediaItemCount).map { activePlayer.getMediaItemAt(it) }
+                val startIndex = activePlayer.currentMediaItemIndex.coerceIn(0, currentItems.size - 1)
+                val startPositionMs = activePlayer.currentPosition.coerceAtLeast(0L)
+                return@future MediaSession.MediaItemsWithStartPosition(
+                    ImmutableList.copyOf(currentItems),
+                    startIndex,
+                    startPositionMs,
+                )
+            }
+
+            // 2. Fallback to local downloaded songs (offline-ready)
+            val downloaded = Downloads.getDownloadedSongs(this@PlaybackService)
+            if (downloaded.isNotEmpty()) {
+                val items = downloaded.map { it.toMediaItem() }
+                return@future MediaSession.MediaItemsWithStartPosition(
+                    ImmutableList.copyOf(items),
+                    0,
+                    0L,
+                )
+            }
+
+            // 3. Fallback to device local music
+            val localSongs = LocalMediaRepository.getLocalMusic(this@PlaybackService)
+            if (localSongs.isNotEmpty()) {
+                val items = localSongs.map { it.toMediaItem() }
+                return@future MediaSession.MediaItemsWithStartPosition(
+                    ImmutableList.copyOf(items),
+                    0,
+                    0L,
+                )
+            }
+
+            // 5. Fallback to Quick Picks / Home shelves
+            val fallbackSongs = try {
+                withTimeoutOrNull(2500L) {
+                    val home = YtMusicRepository.home().getOrNull()
+                    home?.shelves?.flatMap { shelf ->
+                        shelf.items.mapNotNull { it.toMediaItemOrNull() }
+                    }?.distinctBy { it.mediaId }
+                } ?: emptyList()
+            } catch (_: Exception) {
+                emptyList()
+            }
+
+            if (fallbackSongs.isNotEmpty()) {
+                return@future MediaSession.MediaItemsWithStartPosition(
+                    ImmutableList.copyOf(fallbackSongs),
+                    0,
+                    0L,
+                )
+            }
+
+            // Return empty instead of throwing an unhandled exception to prevent crash
+            MediaSession.MediaItemsWithStartPosition(
+                ImmutableList.of(),
+                0,
+                0L,
+            )
+        }
+
+        override fun onSearch(
+            session: MediaLibrarySession,
+            browser: MediaSession.ControllerInfo,
+            query: String,
+            params: LibraryParams?,
+        ): ListenableFuture<LibraryResult<Void>> = scope.future(Dispatchers.IO) {
+            val results = try {
+                withTimeoutOrNull(3000L) {
+                    YtMusicRepository.search(query, SearchFilter.SONGS).getOrNull()
+                } ?: emptyList()
+            } catch (_: Exception) {
+                emptyList()
+            }
+            val songs = results.mapNotNull { if (it is SearchResult.Track) it.song else null }
+            searchResults[query] = songs
+            songs.forEach { songCache[it.videoId] = it }
+            session.notifySearchResultChanged(browser, query, songs.size, params)
+            LibraryResult.ofVoid(params)
+        }
+
+        override fun onGetSearchResult(
+            session: MediaLibrarySession,
+            browser: MediaSession.ControllerInfo,
+            query: String,
+            page: Int,
+            pageSize: Int,
+            params: LibraryParams?,
+        ): ListenableFuture<LibraryResult<ImmutableList<MediaItem>>> = scope.future(Dispatchers.IO) {
+            val songs = searchResults[query] ?: try {
+                withTimeoutOrNull(3000L) {
+                    YtMusicRepository.search(query, SearchFilter.SONGS).getOrNull()
+                        ?.mapNotNull { if (it is SearchResult.Track) it.song else null }
+                } ?: emptyList()
+            } catch (_: Exception) {
+                emptyList()
+            }
+            songs.forEach { songCache[it.videoId] = it }
+            val fromIndex = (page * pageSize).coerceAtMost(songs.size)
+            val toIndex = ((page + 1) * pageSize).coerceAtMost(songs.size)
+            val paged = if (fromIndex < toIndex) songs.subList(fromIndex, toIndex) else songs
+            val items = paged.map { it.toMediaItem() }
+            LibraryResult.ofItemList(ImmutableList.copyOf(items), params)
+        }
+
+        override fun onSetMediaItems(
+            mediaSession: MediaSession,
+            controller: MediaSession.ControllerInfo,
+            mediaItems: List<MediaItem>,
+            startIndex: Int,
+            startPositionMs: Long,
+        ): ListenableFuture<MediaSession.MediaItemsWithStartPosition> = scope.future(Dispatchers.IO) {
+            val resolved = resolveMediaItems(mediaItems)
+            val validIndex = startIndex.coerceIn(0, (resolved.size - 1).coerceAtLeast(0))
+            MediaSession.MediaItemsWithStartPosition(
+                ImmutableList.copyOf(resolved),
+                validIndex,
+                startPositionMs.coerceAtLeast(0L),
+            )
+        }
+
+        override fun onAddMediaItems(
+            mediaSession: MediaSession,
+            controller: MediaSession.ControllerInfo,
+            mediaItems: List<MediaItem>,
+        ): ListenableFuture<List<MediaItem>> = scope.future(Dispatchers.IO) {
+            resolveMediaItems(mediaItems)
+        }
+
+        private suspend fun resolveMediaItems(mediaItems: List<MediaItem>): List<MediaItem> {
+            val resolved = mutableListOf<MediaItem>()
+            for (item in mediaItems) {
+                val id = item.mediaId
+                val searchQuery = item.requestMetadata.searchQuery
+                when {
+                    !searchQuery.isNullOrBlank() -> {
+                        val cached = searchResults[searchQuery]
+                        val songs = if (!cached.isNullOrEmpty()) {
+                            cached
+                        } else {
+                            try {
+                                withTimeoutOrNull(3000L) {
+                                    YtMusicRepository.search(searchQuery, SearchFilter.SONGS).getOrNull()
+                                        ?.mapNotNull { if (it is SearchResult.Track) it.song else null }
+                                } ?: emptyList()
+                            } catch (_: Exception) {
+                                emptyList()
+                            }
+                        }
+                        songs.forEach { songCache[it.videoId] = it }
+                        if (songs.isNotEmpty()) {
+                            resolved.addAll(songs.map { it.toMediaItem() })
+                        }
+                    }
+                    id.startsWith("playlist:") -> {
+                        val playlistId = id.removePrefix("playlist:")
+                        val songs = try {
+                            withTimeoutOrNull(3000L) {
+                                YtMusicRepository.browseSongs("VL$playlistId").getOrNull()?.songs
+                                    ?: YtMusicRepository.browseSongs(playlistId).getOrNull()?.songs
+                            } ?: emptyList()
+                        } catch (_: Exception) {
+                            emptyList()
+                        }
+                        songs.forEach { songCache[it.videoId] = it }
+                        resolved.addAll(songs.map { it.toMediaItem() })
+                    }
+                    id.startsWith("browse:") -> {
+                        val browseId = id.removePrefix("browse:")
+                        val songs = try {
+                            withTimeoutOrNull(3000L) {
+                                YtMusicRepository.browseSongs(browseId).getOrNull()?.songs
+                            } ?: emptyList()
+                        } catch (_: Exception) {
+                            emptyList()
+                        }
+                        songs.forEach { songCache[it.videoId] = it }
+                        resolved.addAll(songs.map { it.toMediaItem() })
+                    }
+                    id == MEDIA_ROOT_ID || id == MEDIA_RECENTS_ID -> {
+                        val songs = cachedRecentsSongs()
+                        resolved.addAll(songs.map { it.toMediaItem() })
+                    }
+                    id == MEDIA_QUICK_PICKS_ID -> {
+                        val songs = cachedQuickPicksSongs()
+                        resolved.addAll(songs.map { it.toMediaItem() })
+                    }
+                    id == MEDIA_LIKED_ID -> {
+                        val songs = cachedLikedSongs()
+                        if (songs.isNotEmpty()) {
+                            resolved.addAll(songs.map { it.toMediaItem() })
+                        }
+                    }
+                    id == MEDIA_DOWNLOADS_ID -> {
+                        val downloaded = Downloads.getDownloadedSongs(this@PlaybackService)
+                        downloaded.forEach { songCache[it.videoId] = it }
+                        resolved.addAll(downloaded.map { it.toMediaItem() })
+                    }
+                    id == MEDIA_PLAYLISTS_ID -> {
+                        val songs = try {
+                            withTimeoutOrNull(2500L) {
+                                val playlists = YtMusicRepository.userPlaylists().getOrNull() ?: emptyList()
+                                val first = playlists.firstOrNull()
+                                if (first != null) {
+                                    YtMusicRepository.browseSongs("VL${first.playlistId}").getOrNull()?.songs
+                                        ?: YtMusicRepository.browseSongs(first.playlistId).getOrNull()?.songs
+                                } else null
+                            } ?: emptyList()
+                        } catch (_: Exception) {
+                            emptyList()
+                        }
+                        songs.forEach { songCache[it.videoId] = it }
+                        resolved.addAll(songs.map { it.toMediaItem() })
+                    }
+                    id == MEDIA_LOCAL_MUSIC_ID -> {
+                        val local = LocalMediaRepository.getLocalMusic(this@PlaybackService)
+                        local.forEach { songCache[it.videoId] = it }
+                        resolved.addAll(local.map { it.toMediaItem() })
+                    }
+                    songCache.containsKey(id) -> {
+                        resolved.add(songCache[id]!!.toMediaItem())
+                    }
+                    item.localConfiguration != null -> {
+                        resolved.add(item)
+                    }
+                    item.requestMetadata.mediaUri != null -> {
+                        val uri = item.requestMetadata.mediaUri!!
+                        val videoId = uri.getQueryParameter("v") ?: uri.lastPathSegment.orEmpty()
+                        if (videoId.isNotEmpty() && !videoId.startsWith("http")) {
+                            val cached = songCache[videoId]
+                            if (cached != null) {
+                                resolved.add(cached.toMediaItem())
+                            } else {
+                                resolved.add(Song(videoId = videoId, title = item.mediaMetadata.title?.toString() ?: "Track", artist = item.mediaMetadata.artist?.toString() ?: "Artist", thumbnailUrl = null).toMediaItem())
+                            }
+                        } else {
+                            resolved.add(item.buildUpon().setUri(uri).build())
+                        }
+                    }
+                    else -> {
+                        val cached = songCache[id]
+                        if (cached != null) {
+                            resolved.add(cached.toMediaItem())
+                        } else {
+                            val song = item.toSong()
+                            resolved.add(song.toMediaItem())
+                        }
+                    }
+                }
+            }
+            return if (resolved.isEmpty()) mediaItems else resolved
+        }
+    }
+
+    private fun createFolderItem(
+        mediaId: String,
+        title: String,
+        subtitle: String? = null,
+        folderType: Int = MediaMetadata.FOLDER_TYPE_MIXED,
+        isGrid: Boolean = false,
+    ): MediaItem {
+        val style = if (isGrid) CONTENT_STYLE_GRID_ITEM_HINT_VALUE else CONTENT_STYLE_LIST_ITEM_HINT_VALUE
+        val extras = Bundle().apply {
+            putInt(EXTRA_CONTENT_STYLE_BROWSABLE_HINT, style)
+            putInt(EXTRA_CONTENT_STYLE_PLAYABLE_HINT, style)
+            putInt(EXTRA_CONTENT_STYLE_BROWSABLE_HINT_AX, style)
+            putInt(EXTRA_CONTENT_STYLE_PLAYABLE_HINT_AX, style)
+            putInt(EXTRA_CONTENT_STYLE_BROWSABLE_HINT_LEGACY, style)
+            putInt(EXTRA_CONTENT_STYLE_PLAYABLE_HINT_LEGACY, style)
+            putInt("android.media.extras.CONTENT_STYLE_BROWSABLE_HINT", style)
+            putInt("android.media.extras.CONTENT_STYLE_PLAYABLE_HINT", style)
+            putInt("android.media.browse.CONTENT_STYLE_BROWSABLE_HINT", style)
+            putInt("android.media.browse.CONTENT_STYLE_PLAYABLE_HINT", style)
+            putBoolean(EXTRA_CONTENT_STYLE_SUPPORTED, true)
+            putBoolean(EXTRA_CONTENT_STYLE_SUPPORTED_AX, true)
+        }
+        return MediaItem.Builder()
+            .setMediaId(mediaId)
+            .setMediaMetadata(
+                MediaMetadata.Builder()
+                    .setTitle(title)
+                    .setSubtitle(subtitle)
+                    .setIsBrowsable(true)
+                    .setIsPlayable(false)
+                    .setFolderType(if (isGrid && folderType == MediaMetadata.FOLDER_TYPE_MIXED) MediaMetadata.FOLDER_TYPE_ALBUMS else folderType)
+                    .setExtras(extras)
+                    .build(),
+            )
+            .build()
+    }
+
+    private fun MediaItem.withGridStyle(): MediaItem {
+        val currentExtras = mediaMetadata.extras ?: Bundle()
+        val newExtras = Bundle(currentExtras).apply {
+            putInt(EXTRA_CONTENT_STYLE_BROWSABLE_HINT, CONTENT_STYLE_GRID_ITEM_HINT_VALUE)
+            putInt(EXTRA_CONTENT_STYLE_PLAYABLE_HINT, CONTENT_STYLE_GRID_ITEM_HINT_VALUE)
+            putInt(EXTRA_CONTENT_STYLE_BROWSABLE_HINT_AX, CONTENT_STYLE_GRID_ITEM_HINT_VALUE)
+            putInt(EXTRA_CONTENT_STYLE_PLAYABLE_HINT_AX, CONTENT_STYLE_GRID_ITEM_HINT_VALUE)
+            putInt(EXTRA_CONTENT_STYLE_BROWSABLE_HINT_LEGACY, CONTENT_STYLE_GRID_ITEM_HINT_VALUE)
+            putInt(EXTRA_CONTENT_STYLE_PLAYABLE_HINT_LEGACY, CONTENT_STYLE_GRID_ITEM_HINT_VALUE)
+            putInt("android.media.extras.CONTENT_STYLE_BROWSABLE_HINT", CONTENT_STYLE_GRID_ITEM_HINT_VALUE)
+            putInt("android.media.extras.CONTENT_STYLE_PLAYABLE_HINT", CONTENT_STYLE_GRID_ITEM_HINT_VALUE)
+            putInt("android.media.browse.CONTENT_STYLE_BROWSABLE_HINT", CONTENT_STYLE_GRID_ITEM_HINT_VALUE)
+            putInt("android.media.browse.CONTENT_STYLE_PLAYABLE_HINT", CONTENT_STYLE_GRID_ITEM_HINT_VALUE)
+            putBoolean(EXTRA_CONTENT_STYLE_SUPPORTED, true)
+            putBoolean(EXTRA_CONTENT_STYLE_SUPPORTED_AX, true)
+        }
+        return buildUpon()
+            .setMediaMetadata(
+                mediaMetadata.buildUpon()
+                    .setIsBrowsable(true)
+                    .setIsPlayable(true)
+                    .setFolderType(MediaMetadata.FOLDER_TYPE_ALBUMS)
+                    .setExtras(newExtras)
+                    .build(),
+            )
+            .build()
+    }
+
+    private fun ShelfItem.toMediaItemOrNull(): MediaItem? {
+        val vid = videoId
+        if (vid != null) {
+            val song = Song(
+                videoId = vid,
+                title = title,
+                artist = subtitle,
+                thumbnailUrl = thumbnailUrl,
+            )
+            songCache[vid] = song
+            return song.toMediaItem()
+        }
+        val bid = browseId
+        if (bid != null) {
+            return MediaItem.Builder()
+                .setMediaId("browse:$bid")
+                .setMediaMetadata(
+                    MediaMetadata.Builder()
+                        .setTitle(title)
+                        .setSubtitle(subtitle)
+                        .setArtworkUri(thumbnailUrl.artworkAt(NOTIFICATION_ART_PX)?.let { Uri.parse(it) })
+                        .setIsBrowsable(true)
+                        .setIsPlayable(false)
+                        .setFolderType(MediaMetadata.FOLDER_TYPE_ALBUMS)
+                        .build(),
+                )
+                .build()
+        }
+        return null
+    }
+
+    private fun createLoginPromptItem(): MediaItem =
+        MediaItem.Builder()
+            .setMediaId("msg:login_required")
+            .setMediaMetadata(
+                MediaMetadata.Builder()
+                    .setTitle("Login with Youtube on your phone")
+                    .setSubtitle("Open BitChord on phone to sign in")
+                    .setIsBrowsable(false)
+                    .setIsPlayable(false)
+                    .build(),
+            )
+            .build()
+
     private companion object {
+        const val MEDIA_ROOT_ID = "root"
+        const val MEDIA_RECENTS_ID = "recents"
+        const val MEDIA_QUICK_PICKS_ID = "quick_picks"
+        const val MEDIA_PLAYLISTS_ID = "playlists"
+        const val MEDIA_MORE_ID = "more"
+        const val MEDIA_LIKED_ID = "liked"
+        const val MEDIA_DOWNLOADS_ID = "downloads"
+        const val MEDIA_LOCAL_MUSIC_ID = "local_music"
+
+        // Android Auto Content Style Hints
+        const val EXTRA_CONTENT_STYLE_SUPPORTED = "android.media.browse.extra.CONTENT_STYLE_SUPPORTED"
+        const val EXTRA_CONTENT_STYLE_SUPPORTED_AX = "androidx.media.contentstyle.CONTENT_STYLE_SUPPORTED"
+        const val EXTRA_CONTENT_STYLE_BROWSABLE_HINT = "android.media.browse.extra.CONTENT_STYLE_BROWSABLE_HINT"
+        const val EXTRA_CONTENT_STYLE_PLAYABLE_HINT = "android.media.browse.extra.CONTENT_STYLE_PLAYABLE_HINT"
+        const val EXTRA_CONTENT_STYLE_BROWSABLE_HINT_AX = "androidx.media.contentstyle.CONTENT_STYLE_BROWSABLE_HINT"
+        const val EXTRA_CONTENT_STYLE_PLAYABLE_HINT_AX = "androidx.media.contentstyle.CONTENT_STYLE_PLAYABLE_HINT"
+        const val EXTRA_CONTENT_STYLE_BROWSABLE_HINT_LEGACY = "androidx.media.utils.CONTENT_STYLE_BROWSABLE_HINT"
+        const val EXTRA_CONTENT_STYLE_PLAYABLE_HINT_LEGACY = "androidx.media.utils.CONTENT_STYLE_PLAYABLE_HINT"
+        const val CONTENT_STYLE_LIST_ITEM_HINT_VALUE = 1
+        const val CONTENT_STYLE_GRID_ITEM_HINT_VALUE = 4
         /**
          * Shared by both players. Identical on purpose: they take turns being
          * the session, and a difference here would be an audible change of
@@ -2631,8 +5145,12 @@ class PlaybackService : MediaSessionService() {
             .setContentType(C.AUDIO_CONTENT_TYPE_MUSIC)
             .build()
 
+        /** Length of a FLAC STREAMINFO block, which the format fixes at 34 bytes. */
+        const val STREAM_INFO_BYTES = 34
+
         const val CHANNEL_ID = "bitchord_playback"
         const val SESSION_ID = "BitChordPlayback"
+        const val ACTION_TOGGLE_FAVORITE = "com.music.bitchord.action.TOGGLE_FAVORITE"
 
         /** How often played-seconds are sampled off the player. */
         const val PROGRESS_SAMPLE_MS = 5_000L
@@ -2708,12 +5226,6 @@ class PlaybackService : MediaSessionService() {
          * be worth the break in the audio it costs.
          */
         const val UPGRADE_MIN_REMAINING_MS = 20_000L
-
-        /**
-         * How far into a track a swap may happen at the earliest, so an
-         * upgrade that arrives with the first note doesn't cut it immediately.
-         */
-        const val UPGRADE_NOT_BEFORE_MS = 5_000L
 
         /** How often to recheck [CrossfadeController.isTransitioning] while an upgrade waits on one. */
         const val UPGRADE_CROSSFADE_POLL_MS = 250L
@@ -2848,8 +5360,8 @@ class PlaybackService : MediaSessionService() {
          * own length before giving up and going on the claimed one.
          *
          * Costs nothing when it isn't needed — a prepared track answers on the
-         * first poll — and the swap it feeds cannot happen inside
-         * [UPGRADE_NOT_BEFORE_MS] anyway.
+         * first poll — and it runs with the music still playing, so what it
+         * spends is patience rather than silence.
          */
         const val DURATION_SETTLE_MS = 8_000L
 
@@ -2862,6 +5374,21 @@ class PlaybackService : MediaSessionService() {
 
         /** How many times one track is picked up off the floor — see [recoverFrom]. */
         const val MAX_RECOVERIES = 2
+
+        /**
+         * How many tracks in a row may be skipped for a plain playback error
+         * before the queue is left alone — see [skipReason]. Sized to walk a
+         * short run of broken tracks without walking an entire queue that is
+         * only failing because there is no connection behind it.
+         */
+        const val MAX_CONSECUTIVE_SKIPS = 4
+
+        /**
+         * How far into an exception's causes a resolver verdict is looked for.
+         * Media3 wraps twice on this path and the coroutine machinery may add
+         * one; nothing nests deeper. See [permanentReason].
+         */
+        const val PERMANENT_CAUSE_DEPTH = 8
 
         /**
          * The pause before a retry. Media3 refuses to remove a cache entry a

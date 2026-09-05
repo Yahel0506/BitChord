@@ -12,6 +12,21 @@ import kotlinx.serialization.json.Json
 import okhttp3.Request
 
 /**
+ * A module/index URL with its host hidden, for logging.
+ *
+ * These URLs point at the module index the build secret supplies —
+ * [SourceRegistry][com.music.bitchord.data.sources.SourceRegistry] never
+ * shows it on screen (see the sources settings screen), so debug logcat
+ * shouldn't hand it out either. Only the host is sensitive; the path is kept
+ * so a fetch failure or cache hit is still traceable to which endpoint it was.
+ */
+internal fun redactModuleUrl(url: String): String =
+    runCatching {
+        val uri = java.net.URI(url)
+        "${uri.scheme}://***${uri.rawPath.orEmpty()}"
+    }.getOrDefault("***")
+
+/**
  * Fetches a module index, downloads and loads module JS, and calls the
  * module's exported search/stream functions.
  *
@@ -80,19 +95,19 @@ class ModuleManager {
                 if (cached != null &&
                     System.currentTimeMillis() - cached.fetchedAtMs < INDEX_TTL_MS
                 ) {
-                    TrackLog.d(TAG, "▶ fetchIndex($sourceUrl) — CACHE HIT (${cached.modules.size} modules)")
+                    TrackLog.d(TAG, "▶ fetchIndex(${redactModuleUrl(sourceUrl)}) — CACHE HIT (${cached.modules.size} modules)")
                     return@withContext Result.success(cached.modules)
                 }
 
-                TrackLog.d(TAG, "▶ fetchIndex($sourceUrl)")
+                TrackLog.d(TAG, "▶ fetchIndex(${redactModuleUrl(sourceUrl)})")
                 runCatching {
                     val request = Request.Builder().url(sourceUrl).build()
                     Http.client.newCall(request).execute().use { resp ->
                         if (!resp.isSuccessful) {
-                            throw Exception("HTTP ${resp.code} from $sourceUrl")
+                            throw Exception("HTTP ${resp.code} from ${redactModuleUrl(sourceUrl)}")
                         }
                         val body = resp.body?.string()
-                            ?: throw Exception("Empty body from $sourceUrl")
+                            ?: throw Exception("Empty body from ${redactModuleUrl(sourceUrl)}")
                         val modules = ModuleIndex.parseModules(json, body)
                         TrackLog.d(TAG, "  Parsed ${modules.size} modules")
                         modules
@@ -100,7 +115,7 @@ class ModuleManager {
                 }.onSuccess {
                     indexCache[sourceUrl] = CachedIndex(it, System.currentTimeMillis())
                 }.onFailure {
-                    TrackLog.e(TAG, "  ✗ fetchIndex FAILED for $sourceUrl: ${it.message}", it)
+                    TrackLog.e(TAG, "  ✗ fetchIndex FAILED for ${redactModuleUrl(sourceUrl)}: ${it.message}", it)
                 }
             }
         }
@@ -114,6 +129,13 @@ class ModuleManager {
      * absolute base — callers pass `{ sourceUrl.substringBeforeLast("/") }`.
      *
      * Results are cached; a second call for the same id returns immediately.
+     *
+     * The cache is checked against the executor rather than on its own. Engines
+     * are LRU-capped over there and this map is not told when one is evicted,
+     * so a hit here could name a module whose engine had already been closed —
+     * and the caller then went straight to a `callExport` that could only fail
+     * with "not loaded". Re-initialising costs a JS evaluation, but not the
+     * download: the source is what this map is really holding.
      */
     suspend fun loadModule(
         module: SpineModule,
@@ -121,8 +143,15 @@ class ModuleManager {
     ): Result<LoadedModule> = withContext(Dispatchers.IO) {
         val cached = loadedModules[module.id]
         if (cached != null) {
-            TrackLog.d(TAG, "▶ loadModule(${module.id}) — CACHE HIT")
-            return@withContext Result.success(cached)
+            if (QuickJsExecutor.isLoaded(module.id)) {
+                TrackLog.d(TAG, "▶ loadModule(${module.id}) — CACHE HIT")
+                return@withContext Result.success(cached)
+            }
+            val revived = QuickJsExecutor
+                .loadModule(module.id, cached.jsCode, cached.baseUrl)
+                .map { cached }
+            if (revived.isSuccess) return@withContext revived
+            loadedModules.remove(module.id)
         }
 
         TrackLog.d(TAG, "▶ loadModule(${module.id}) download=${module.download}")
@@ -134,7 +163,7 @@ class ModuleManager {
                 "$base/${module.download}"
             }
 
-            TrackLog.d(TAG, "  Resolved download URL: $downloadUrl")
+            TrackLog.d(TAG, "  Resolved download URL: ${redactModuleUrl(downloadUrl)}")
             val request = Request.Builder().url(downloadUrl).build()
             val jsCode = Http.client.newCall(request).execute().use { resp ->
                 if (!resp.isSuccessful) {
@@ -148,7 +177,7 @@ class ModuleManager {
 
             val loaded = LoadedModule(module = module, jsCode = jsCode, baseUrl = baseUrl)
             loadedModules[module.id] = loaded
-            TrackLog.d(TAG, "  ✓ Loaded module ${module.id}: ${jsCode.length} chars, baseUrl=$baseUrl")
+            TrackLog.d(TAG, "  ✓ Loaded module ${module.id}: ${jsCode.length} chars, baseUrl=${redactModuleUrl(baseUrl)}")
             loaded
         }.onFailure {
             TrackLog.e(TAG, "  ✗ loadModule FAILED for ${module.id}: ${it.message}", it)
@@ -206,7 +235,7 @@ class ModuleManager {
                 args = listOf("\"$trackId\"", "\"$quality\"", contextArg),
             ).getOrThrow()
             json.decodeFromString<ModuleStreamResponse>(result).also {
-                TrackLog.d(TAG, "  ✓ streamUrl=${it.streamUrl.take(100)} quality=${it.track?.audioQuality}")
+                TrackLog.d(TAG, "  ✓ streamUrl=${it.streamUrl?.take(100) ?: "<none>"} quality=${it.track?.audioQuality}")
             }
         }.onCancellation().onFailure {
             TrackLog.e(TAG, "  ✗ getStreamUrl FAILED for ${loaded.module.id} trackId=$trackId: ${it.message}", it)

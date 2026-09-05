@@ -1,11 +1,15 @@
 package com.music.bitchord.ui.screens
 
+import com.music.bitchord.R
+
+import androidx.compose.animation.animateContentSize
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
@@ -27,9 +31,14 @@ import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.Add
+import androidx.compose.material.icons.rounded.Close
+import androidx.compose.material.icons.rounded.GraphicEq
+import androidx.compose.material.icons.rounded.MoreHoriz
 import androidx.compose.material.icons.rounded.MoreVert
+import androidx.compose.material.icons.rounded.Person
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
@@ -39,28 +48,35 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.res.pluralStringResource
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.clipToBounds
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.layout.ContentScale
-import androidx.compose.ui.platform.LocalConfiguration
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.border
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import coil3.compose.AsyncImage
 import dev.chrisbanes.haze.HazeState
 import dev.chrisbanes.haze.HazeTint
-import dev.chrisbanes.haze.hazeEffect
 import dev.chrisbanes.haze.hazeSource
 import dev.chrisbanes.haze.materials.ExperimentalHazeMaterialsApi
 import dev.chrisbanes.haze.materials.HazeMaterials
@@ -73,10 +89,14 @@ import com.music.bitchord.data.model.HEADER_ART_PX
 import com.music.bitchord.data.model.ROW_ART_PX
 import com.music.bitchord.data.model.ShelfItem
 import com.music.bitchord.data.model.Song
+import com.music.bitchord.data.model.SubscriptionState
 import com.music.bitchord.data.model.UiState
 import com.music.bitchord.data.model.artworkAt
+import com.music.bitchord.data.model.isSameTrackAs
 import com.music.bitchord.data.settings.AppSettings
 import com.music.bitchord.ui.components.ArtworkWash
+import com.music.bitchord.ui.components.DownloadedBadge
+import com.music.bitchord.ui.components.ExplicitSongTitle
 import com.music.bitchord.ui.components.MessageState
 import com.music.bitchord.ui.components.PAGE_GUTTER
 import com.music.bitchord.ui.components.ROW_DIVIDER_INSET
@@ -84,11 +104,28 @@ import com.music.bitchord.ui.components.SHELF_CARD_WIDTH
 import com.music.bitchord.ui.components.SongRow
 import com.music.bitchord.ui.components.thumbnailBorder
 import com.music.bitchord.ui.components.detailSkeleton
+import com.music.bitchord.ui.components.topBarContentPadding
+import com.music.bitchord.ui.haptics.Haptic
+import com.music.bitchord.ui.haptics.rememberHaptics
 import com.music.bitchord.ui.icons.BitChordIcons
 import com.music.bitchord.ui.player.CanvasArtworkPlayer
 import com.music.bitchord.ui.theme.ArtworkPalette
+import com.music.bitchord.ui.components.optimizedHazeEffect
 import com.music.bitchord.ui.theme.rememberArtworkPalette
 import kotlin.math.roundToInt
+import java.util.Locale
+
+/**
+ * Ordering for the track list on an album or playlist page — the same idea as
+ * the Downloads folder's sort, but without a date: a catalogue row carries
+ * none, so [DEFAULT] (the release's own running order) is the only option
+ * that isn't alphabetical.
+ */
+enum class SongSort {
+    DEFAULT,
+    TITLE_ASC,
+    TITLE_DESC,
+}
 
 private const val MAX_ARTIST_SONGS = 20
 private const val SONGS_PER_COLUMN = 4
@@ -105,8 +142,18 @@ private const val SLEEVE_FRACTION = 0.80f
 private val SLEEVE_SHAPE = RoundedCornerShape(12.dp)
 private val PILL_SHAPE = RoundedCornerShape(12.dp)
 
+/**
+ * Where the search field sits once it is open — directly under the header,
+ * which is item zero. The one place that has to know, so that opening the
+ * search can carry the page up to it.
+ */
+private const val SEARCH_ITEM_INDEX = 1
+
 /** The inset the header text and the action pills share. */
 private val HEADER_GUTTER = PAGE_GUTTER + 14.dp
+
+/** Extra breathing room for the editorial copy on album and artist pages. */
+private val ABOUT_GUTTER = PAGE_GUTTER + 12.dp
 
 /**
  * How far past the foot of the artwork the title block is allowed to hang.
@@ -138,23 +185,37 @@ private val HEADER_DROP = 44.dp
  * that have been made to *resemble* each other, and the eye finds that edge
  * every time. A single blur that samples across the join has no edge to find:
  * the picture, the colour under it and the colour under the song rows are all
- * one smear of the same glass. It is the same thing [BottomFadeBlur] does to
- * the foot of the screen, pointed at the middle of this one.
+ * one smear of the same glass. It is the same thing [TopFadeBlur] does to the
+ * head of the screen, pointed at the middle of this one.
  */
 @Composable
 fun DetailScreen(
     page: DetailPage,
+    currentSong: Song?,
+    isPlaying: Boolean,
     onSongClick: (List<Song>, Int) -> Unit,
     onSongLongPress: (Song) -> Unit,
     onSongSwipe: (Song) -> Unit,
     onShuffle: (List<Song>) -> Unit,
     onSectionItemClick: (ShelfItem) -> Unit,
-    onDownloadAll: (List<Song>) -> Unit,
     onArtistClick: (String, String) -> Unit,
     onAddSuggested: (Song) -> Unit,
     contentPadding: PaddingValues,
     modifier: Modifier = Modifier,
     listState: LazyListState = rememberLazyListState(),
+    /**
+     * Holding one of the album cards on an artist page — the same menu the
+     * shelves on every other tab open, so a release can be queued from
+     * wherever it is seen rather than only from its own page.
+     */
+    onSectionItemLongPress: ((ShelfItem) -> Unit)? = null,
+    /**
+     * The header's overflow: everything this page can do to its whole track
+     * list that isn't already one of the buttons beside it — downloading it
+     * among them, see [com.music.bitchord.ui.components.BrowseActionsSheet].
+     * Null on the pages with no list to act on.
+     */
+    onMore: ((List<Song>) -> Unit)? = null,
     /**
      * Saves this release to the account's library, or takes it out —
      * [DetailPage.library] says which way round. Null hides the control
@@ -163,10 +224,72 @@ fun DetailScreen(
      * wouldn't just be refused.
      */
     onToggleLibrary: (() -> Unit)? = null,
+    /**
+     * Subscribes to this artist's channel, or unsubscribes —
+     * [DetailPage.subscription] says which way round. The artist page's answer
+     * to [onToggleLibrary], and null in the same circumstances: a guest, or a
+     * page whose header never offered the button.
+     */
+    onToggleSubscription: (() -> Unit)? = null,
+    /**
+     * How the track list is ordered — the release's own running order by
+     * default, or alphabetical. Owned by the caller rather than this page
+     * because the control for it lives in the top bar, alongside the account
+     * photo, not in this header.
+     */
+    songSort: SongSort = SongSort.DEFAULT,
 ) {
-    val songs = (page.songs as? UiState.Success)?.data.orEmpty()
+    val rawSongs = (page.songs as? UiState.Success)?.data.orEmpty()
+    val songs = remember(rawSongs, songSort) { rawSongs.sortedForDetail(songSort) }
+    // What a numbered row shows regardless of [songSort] — an album's track
+    // numbers are the sleeve's own and must not relabel themselves to match
+    // wherever a sort put the row.
+    val originalTrackNumbers = remember(rawSongs) {
+        rawSongs.withIndex().associate { (i, s) -> s.videoId to i + 1 }
+    }
     val isArtist = page.type == BrowseType.ARTIST
     val palette = rememberArtworkPalette(page.thumbnailUrl)
+
+    // Narrowing the running order in place — the release equivalent of the
+    // filter box on the Local Music tab, and the one thing a long track list
+    // needs that scrolling can't give it. Off by default and reset with the
+    // page: a filter left on an album that was closed and reopened would be a
+    // page that appears to have lost most of its tracks.
+    var searching by rememberSaveable(page.browseId) { mutableStateOf(false) }
+    var query by rememberSaveable(page.browseId) { mutableStateOf("") }
+    // Whether the field still owes the keyboard an appearance. Held here rather
+    // than in the field, which is a row in a lazy list: scrolled out of sight it
+    // is disposed, and a field that asks for focus every time it is composed
+    // would throw the keyboard back up each time it scrolled into view.
+    var focusSearch by remember(page.browseId) { mutableStateOf(false) }
+    val closeSearch = {
+        searching = false
+        query = ""
+    }
+    // Back closes the search first — this handler is registered after the one
+    // that pops the page, so it is the one that answers while it's enabled.
+    BackHandler(enabled = searching) { closeSearch() }
+
+    // Each surviving row still knows where it sat in the full running order, so
+    // an album's track numbers stay the album's rather than becoming positions
+    // in the filtered list.
+    val matches = remember(songs, query) { songs.matching(query) }
+    // What a tap plays: for playlists the full list (preserving context), so
+    // searching and tapping still stays inside the playlist. For albums / other
+    // browse types the filtered set is used — playing an entire album from a
+    // single search hit would queue tracks the user never asked for.
+    val queue = remember(songs, matches, page.type) {
+        if (page.type == BrowseType.PLAYLIST) songs else matches.map { it.value }
+    }
+    val suggested = remember(page.suggestedSongs, query) {
+        page.suggestedSongs.matching(query).map { it.value }
+    }
+
+    // What marks a row as already downloaded, tinted from the sleeve like the
+    // rest of the page. Null on any page that is itself a reading of this
+    // device — the Downloads folder, one downloaded playlist — where every row
+    // qualifies and the badge would be decoration rather than information.
+    val downloadedTint = palette.accent.takeUnless { page.browseId.startsWith("local:") }
 
     // Animated cover art on the header, the same feature the player has.
     // Albums only: a playlist's artwork is a collage and an artist page's is a
@@ -175,9 +298,7 @@ fun DetailScreen(
     // The credit line the header shows is the artist as far as the catalogue
     // services are concerned. A browse card's subtitle sometimes omits it, in
     // which case the tracks themselves know who it is.
-    val credit = remember(page.subtitle, songs) {
-        page.headerLines(songs.size).first.ifBlank { songs.firstOrNull()?.artist.orEmpty() }
-    }
+    val credit = page.headerLines(songs.size).first.ifBlank { songs.firstOrNull()?.artist.orEmpty() }
     var canvas by remember(page.browseId) { mutableStateOf<CanvasArtwork?>(null) }
     LaunchedEffect(page.browseId, page.title, credit, canvasEnabled) {
         if (!canvasEnabled || page.type != BrowseType.ALBUM) {
@@ -191,13 +312,29 @@ fun DetailScreen(
     }
 
     val pageHaze = remember { HazeState() }
-    // The artwork is drawn behind the list rather than in it, so both need to
-    // agree on its height without being able to ask each other. The width is
-    // the screen's, so the ratio decides it and both can work it out alone.
-    val artHeight = LocalConfiguration.current.screenWidthDp.dp /
-        if (isArtist) ARTIST_PHOTO_RATIO else SLEEVE_RATIO
 
-    Box(modifier.fillMaxSize()) {
+    // Opening the search carries the page up to it, so the field lands just
+    // clear of the frosted bar with the tracks under it rather than at the foot
+    // of a screen still filled with artwork. Done as an effect rather than in
+    // the tap, so the row it scrolls to is already in the list by the time it
+    // runs.
+    val searchStop = with(LocalDensity.current) { topBarContentPadding().roundToPx() }
+    LaunchedEffect(searching) {
+        if (searching) listState.animateScrollToItem(SEARCH_ITEM_INDEX, -searchStop)
+    }
+
+    BoxWithConstraints(modifier.fillMaxSize()) {
+        // The artwork is drawn behind the list rather than in it, so both need
+        // to agree on its height without being able to ask each other. The
+        // width is the page's, so the ratio decides it and both can work it out
+        // alone.
+        //
+        // Measured rather than read off the window, because the two are not the
+        // same number everywhere: on a tablet the page is the column left over
+        // once the player has its pane, and a height derived from the whole
+        // window there is a sleeve half again as tall as it is wide.
+        val artHeight = maxWidth / if (isArtist) ARTIST_PHOTO_RATIO else SLEEVE_RATIO
+
         PageBackground(
             page = page,
             palette = palette,
@@ -234,11 +371,42 @@ fun DetailScreen(
                         songs = songs,
                         onPlay = { onSongClick(songs, 0) },
                         onShuffle = { onShuffle(songs) },
-                        // A page of on-device tracks has nothing further away
-                        // to fetch — everything on it is already local.
-                        onDownload = onDownloadAll.takeUnless { page.browseId.startsWith("local:") },
+                        searching = searching,
+                        onSearch = {
+                            if (searching) {
+                                closeSearch()
+                            } else {
+                                searching = true
+                                focusSearch = true
+                            }
+                        },
+                        onMore = onMore,
                         onArtistClick = onArtistClick,
                         onToggleLibrary = onToggleLibrary,
+                    )
+                }
+            }
+
+            if (isArtist && (page.subscriberCountText != null || page.monthlyListenerCount != null)) {
+                item(key = "artist-stats") {
+                    ArtistStatsRow(
+                        subscriberCountText = page.subscriberCountText,
+                        monthlyListenerCount = page.monthlyListenerCount,
+                        palette = palette,
+                    )
+                }
+            }
+
+            if (searching) {
+                item(key = "search") {
+                    DetailSearchField(
+                        query = query,
+                        onQueryChange = { query = it },
+                        onClose = closeSearch,
+                        autoFocus = focusSearch,
+                        onFocused = { focusSearch = false },
+                        palette = palette,
+                        type = page.type,
                     )
                 }
             }
@@ -249,6 +417,29 @@ fun DetailScreen(
                         palette = palette,
                         onPlay = { onSongClick(songs, 0) },
                         onShuffle = { onShuffle(songs) },
+                        subscription = page.subscription?.takeIf { onToggleSubscription != null },
+                        onToggleSubscription = onToggleSubscription,
+                        // Halved when an About section follows directly — see
+                        // [AboutSection]'s own top inset, which makes up the
+                        // rest of that shorter gap.
+                        bottomSpace = if (page.description.isNullOrBlank()) 22.dp else 11.dp,
+                    )
+                }
+            }
+
+            // YouTube's own editorial blurb — an album or an artist only, per
+            // [DetailPage.description]. A playlist never carries one, and the
+            // section is skipped for it even on the rare response that does.
+            if (!page.description.isNullOrBlank() &&
+                (page.type == BrowseType.ALBUM || isArtist)
+            ) {
+                item(key = "about") {
+                    AboutSection(
+                        title = stringResource(
+                            if (isArtist) R.string.about_artist else R.string.about_album,
+                        ),
+                        text = page.description,
+                        palette = palette,
                     )
                 }
             }
@@ -261,7 +452,7 @@ fun DetailScreen(
                     // it pages sideways four at a time and stops at twenty.
                     item {
                         val top = state.data.take(MAX_ARTIST_SONGS)
-                        SectionHeading("Top songs", palette)
+                        SectionHeading(stringResource(R.string.top_songs), palette)
                         LazyRow(
                             contentPadding = PaddingValues(horizontal = PAGE_GUTTER),
                             horizontalArrangement = Arrangement.spacedBy(12.dp),
@@ -274,6 +465,7 @@ fun DetailScreen(
                                             palette = palette,
                                             onClick = { onSongClick(top, top.indexOf(song)) },
                                             onLongPress = { onSongLongPress(song) },
+                                            downloadedTint = downloadedTint,
                                         )
                                     }
                                 }
@@ -285,21 +477,37 @@ fun DetailScreen(
                     // already the largest thing on the page — Apple Music
                     // numbers those rows instead, and so does this.
                     val numbered = page.type == BrowseType.ALBUM
-                    itemsIndexed(state.data) { index, song ->
+                    if (matches.isEmpty() && state.data.isNotEmpty()) {
+                        item(key = "no-matches") {
+                            MessageState(stringResource(R.string.nothing_matches, query))
+                        }
+                    }
+                    itemsIndexed(matches) { position, entry ->
+                        val song = entry.value
+                        val isCurrent = song.isSameTrackAs(currentSong)
                         SongRow(
                             song = if (numbered) {
                                 song
                             } else {
                                 song.copy(thumbnailUrl = song.thumbnailUrl ?: page.thumbnailUrl)
                             },
-                            onClick = { onSongClick(state.data, index) },
+                            onClick = {
+                                val startIdx = if (page.type == BrowseType.PLAYLIST) entry.index else position
+                                onSongClick(queue, startIdx)
+                            },
                             onLongPress = { onSongLongPress(song) },
                             onSwipeToQueue = { onSongSwipe(song) },
                             rowBackground = Color.Transparent,
-                            trackNumber = (index + 1).takeIf { numbered },
+                            // The track's place on the release, not its place in
+                            // what the filter — or a sort — left standing.
+                            trackNumber = originalTrackNumbers[song.videoId].takeIf { numbered },
                             subtitleColor = palette.onBackgroundVariant,
+                            downloadedTint = downloadedTint,
+                            isCurrent = isCurrent,
+                            isPlaying = isCurrent && isPlaying,
+                            activeTint = palette.accent,
                         )
-                        if (index < state.data.lastIndex) {
+                        if (position < matches.lastIndex) {
                             HorizontalDivider(
                                 modifier = Modifier.padding(start = ROW_DIVIDER_INSET),
                                 thickness = 0.5.dp,
@@ -312,22 +520,23 @@ fun DetailScreen(
 
             // Tracks YouTube offers to round the playlist out, never folded
             // into the list above — see [DetailPage.suggestedSongs].
-            if (page.suggestedSongs.isNotEmpty()) {
+            if (suggested.isNotEmpty()) {
                 item(key = "suggested-heading") {
-                    SectionHeading("Suggested", palette)
+                    SectionHeading(stringResource(R.string.suggested), palette)
                 }
                 itemsIndexed(
-                    page.suggestedSongs,
+                    suggested,
                     key = { _, song -> "suggested-${song.videoId}" },
                 ) { index, song ->
                     SuggestedSongRow(
                         song = song,
                         palette = palette,
-                        onClick = { onSongClick(page.suggestedSongs, index) },
+                        onClick = { onSongClick(suggested, index) },
                         onLongPress = { onSongLongPress(song) },
                         onAdd = { onAddSuggested(song) },
+                        downloadedTint = downloadedTint,
                     )
-                    if (index < page.suggestedSongs.lastIndex) {
+                    if (index < suggested.lastIndex) {
                         HorizontalDivider(
                             modifier = Modifier.padding(start = ROW_DIVIDER_INSET),
                             thickness = 0.5.dp,
@@ -350,6 +559,7 @@ fun DetailScreen(
                                 item = item,
                                 palette = palette,
                                 onClick = { onSectionItemClick(item) },
+                                onLongPress = onSectionItemLongPress?.let { { it(item) } },
                             )
                         }
                     }
@@ -377,7 +587,9 @@ private fun ReleaseHeader(
     songs: List<Song>,
     onPlay: () -> Unit,
     onShuffle: () -> Unit,
-    onDownload: ((List<Song>) -> Unit)?,
+    searching: Boolean,
+    onSearch: () -> Unit,
+    onMore: ((List<Song>) -> Unit)?,
     onArtistClick: (String, String) -> Unit,
     onToggleLibrary: (() -> Unit)?,
 ) {
@@ -453,12 +665,23 @@ private fun ReleaseHeader(
                 // Only where YouTube said the release can be saved and the
                 // caller is willing to take the write — see [onToggleLibrary].
                 val library = page.library?.takeIf { onToggleLibrary != null }
+                // Four circles and the pill is as much as this row can carry,
+                // and on a 360dp screen it only carries it by giving something
+                // up: the pill sheds padding first, being the widest thing here,
+                // and the circles come down 4dp after that. The alternative is a
+                // row that runs off the edge of the screen.
+                val circles = listOfNotNull(library, onMore).size + 2 // + Shuffle, Search
+                val full = circles >= 4
+                val circleSize = if (full) 46.dp else 50.dp
                 Spacer(Modifier.height(14.dp))
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
                         .padding(horizontal = HEADER_GUTTER),
-                    horizontalArrangement = Arrangement.spacedBy(10.dp, Alignment.CenterHorizontally),
+                    horizontalArrangement = Arrangement.spacedBy(
+                        if (full) 8.dp else 10.dp,
+                        Alignment.CenterHorizontally,
+                    ),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
                     if (library != null) {
@@ -467,40 +690,174 @@ private fun ReleaseHeader(
                             // "not yet / done", which is what the state is.
                             icon = if (library.saved) BitChordIcons.Check else BitChordIcons.Plus,
                             contentDescription = if (library.saved) {
-                                "Remove from library"
+                                stringResource(R.string.remove_from_library)
                             } else {
-                                "Add to library"
+                                stringResource(R.string.add_to_library)
                             },
                             palette = palette,
                             onClick = { onToggleLibrary?.invoke() },
+                            haptic = if (library.saved) Haptic.ToggleOff else Haptic.ToggleOn,
+                            size = circleSize,
                         )
                     }
                     CircleIconButton(
                         icon = BitChordIcons.Shuffle,
-                        contentDescription = "Shuffle",
+                        contentDescription = stringResource(R.string.shuffle),
                         palette = palette,
                         onClick = onShuffle,
+                        haptic = Haptic.Resume,
+                        size = circleSize,
                     )
                     PlayPill(
                         palette = palette,
                         onClick = onPlay,
-                        // The pill is the widest thing in the row and the first
-                        // to be squeezed when a third circle joins it, so it
-                        // gives up padding rather than letting the row run off
-                        // the edge of a narrow screen.
-                        horizontalPadding = if (library != null && onDownload != null) 24.dp else 32.dp,
+                        horizontalPadding = when (circles) {
+                            1, 2 -> 32.dp
+                            3 -> 24.dp
+                            else -> 14.dp
+                        },
                     )
-                    onDownload?.let { download ->
+                    // Where the download circle used to be. Downloading a
+                    // release is a thing done once and then not thought about;
+                    // finding a track on a long playlist is a thing done while
+                    // reading the page, so it is the one that earns a button and
+                    // the download moved to the overflow beside it.
+                    CircleIconButton(
+                        icon = if (searching) Icons.Rounded.Close else BitChordIcons.Search,
+                        contentDescription = stringResource(
+                            if (searching) R.string.close_search else R.string.search_this_list,
+                        ),
+                        palette = palette,
+                        onClick = onSearch,
+                        size = circleSize,
+                    )
+                    onMore?.let { more ->
                         CircleIconButton(
-                            icon = BitChordIcons.Download,
-                            contentDescription = "Download all",
+                            icon = Icons.Rounded.MoreHoriz,
+                            contentDescription = stringResource(R.string.more),
                             palette = palette,
-                            onClick = { download(songs) },
+                            onClick = { more(songs) },
+                            size = circleSize,
                         )
                     }
                 }
             }
         }
+    }
+}
+
+/**
+ * The filter box, shown under the header while the search circle is lit.
+ *
+ * Live rather than submit-on-enter, and for the same reason the Local Music
+ * one is (see `LocalSearchField`): the list it narrows is already in memory, so
+ * there is nothing for a submit action to wait for.
+ *
+ * Glass rather than a filled field — it is one of the header's controls that
+ * happens to be typed into, and it sits close enough to the circles that a
+ * Material text field beside them would read as a different app's furniture.
+ */
+@Composable
+private fun DetailSearchField(
+    query: String,
+    onQueryChange: (String) -> Unit,
+    onClose: () -> Unit,
+    autoFocus: Boolean,
+    onFocused: () -> Unit,
+    palette: ArtworkPalette,
+    type: BrowseType,
+) {
+    // Opened by a tap on a button, which is as clear a statement of intent as
+    // the keyboard is going to get — so it comes up with the field rather than
+    // making the tap land twice. Once only: see [autoFocus]'s owner.
+    val focus = remember { FocusRequester() }
+    LaunchedEffect(autoFocus) {
+        if (autoFocus) {
+            focus.requestFocus()
+            onFocused()
+        }
+    }
+
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = HEADER_GUTTER)
+            .padding(bottom = 10.dp)
+            .height(46.dp)
+            .clip(PILL_SHAPE)
+            .background(MaterialTheme.colorScheme.surface.copy(alpha = 0.6f))
+            .border(0.5.dp, Color.White.copy(alpha = 0.10f), PILL_SHAPE)
+            .padding(horizontal = 12.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Icon(
+            imageVector = BitChordIcons.Search,
+            contentDescription = null,
+            tint = palette.onBackgroundVariant,
+            modifier = Modifier.size(18.dp),
+        )
+        Spacer(Modifier.width(10.dp))
+        Box(Modifier.weight(1f)) {
+            if (query.isEmpty()) {
+                Text(
+                    text = stringResource(R.string.search_this_list),
+                    style = MaterialTheme.typography.bodyLarge,
+                    color = palette.onBackgroundVariant,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+            BasicTextField(
+                value = query,
+                onValueChange = onQueryChange,
+                singleLine = true,
+                textStyle = MaterialTheme.typography.bodyLarge.copy(color = palette.onBackground),
+                cursorBrush = SolidColor(palette.accent),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .focusRequester(focus),
+            )
+        }
+        Box(
+            modifier = Modifier
+                .size(30.dp)
+                .clip(CircleShape)
+                // Clearing and closing are the same gesture: an empty filter
+                // showing an unfiltered list is a row of furniture with nothing
+                // left to do.
+                .clickable { if (query.isEmpty()) onClose() else onQueryChange("") },
+            contentAlignment = Alignment.Center,
+        ) {
+            Icon(
+                imageVector = Icons.Rounded.Close,
+                contentDescription = stringResource(
+                    if (query.isEmpty()) R.string.close_search else R.string.clear_search,
+                ),
+                tint = palette.onBackgroundVariant,
+                modifier = Modifier.size(17.dp),
+            )
+        }
+    }
+}
+
+private fun List<Song>.sortedForDetail(sort: SongSort): List<Song> = when (sort) {
+    SongSort.DEFAULT -> this
+    SongSort.TITLE_ASC -> sortedWith(compareBy(String.CASE_INSENSITIVE_ORDER) { it.title })
+    SongSort.TITLE_DESC -> sortedWith(compareByDescending(String.CASE_INSENSITIVE_ORDER) { it.title })
+}
+
+/**
+ * The rows a typed query leaves standing, each still carrying its place in the
+ * full list — see the track numbers on an album, which are the release's own
+ * and not positions in whatever the filter left.
+ */
+private fun List<Song>.matching(query: String): List<IndexedValue<Song>> {
+    val all = withIndex().toList()
+    if (query.isBlank()) return all
+    return all.filter { (_, song) ->
+        song.title.contains(query, ignoreCase = true) ||
+            song.artist.contains(query, ignoreCase = true) ||
+            song.albumName?.contains(query, ignoreCase = true) == true
     }
 }
 
@@ -521,7 +878,10 @@ private fun ArtistHeader(page: DetailPage, palette: ArtworkPalette, artHeight: D
             overflow = TextOverflow.Ellipsis,
             modifier = Modifier
                 .align(Alignment.BottomCenter)
-                .padding(horizontal = HEADER_GUTTER, vertical = 14.dp),
+                // Bottom is half the top inset — the stats pills (or, absent
+                // those, the action row) sit closer under the name than the
+                // name sits under the artwork.
+                .padding(start = HEADER_GUTTER, end = HEADER_GUTTER, top = 14.dp, bottom = 7.dp),
         )
     }
 }
@@ -669,7 +1029,7 @@ private fun MergeBand(
                         ).roundToInt(),
                 )
             }
-            .hazeEffect(hazeState) {
+            .optimizedHazeEffect(hazeState) {
                 // Without this the band draws nothing at all.
                 //
                 // Haze defaults to only blurring sources *below* it, which it
@@ -734,7 +1094,15 @@ private val MERGE_BLUR = 100.dp
 
 /** Shuffle • Play • Download — the Apple Music action row. */
 @Composable
-private fun ActionRow(palette: ArtworkPalette, onPlay: () -> Unit, onShuffle: () -> Unit) {
+private fun ActionRow(
+    palette: ArtworkPalette,
+    onPlay: () -> Unit,
+    onShuffle: () -> Unit,
+    bottomSpace: Dp = 22.dp,
+    /** The artist header's subscribe state, or null where it isn't offered. */
+    subscription: SubscriptionState? = null,
+    onToggleSubscription: (() -> Unit)? = null,
+) {
     Row(
         modifier = Modifier
             .fillMaxWidth()
@@ -742,12 +1110,27 @@ private fun ActionRow(palette: ArtworkPalette, onPlay: () -> Unit, onShuffle: ()
         horizontalArrangement = Arrangement.spacedBy(10.dp, Alignment.CenterHorizontally),
         verticalAlignment = Alignment.CenterVertically,
     ) {
+        // Subscribing sits where saving does on a release — first circle, left
+        // of Shuffle — and says the same thing with the same pair of icons.
+        if (subscription != null) {
+            CircleIconButton(
+                icon = if (subscription.subscribed) BitChordIcons.Check else BitChordIcons.Plus,
+                contentDescription = stringResource(
+                    if (subscription.subscribed) R.string.unsubscribe else R.string.subscribe,
+                ),
+                palette = palette,
+                onClick = { onToggleSubscription?.invoke() },
+                haptic = if (subscription.subscribed) Haptic.ToggleOff else Haptic.ToggleOn,
+            )
+        }
+
         // Circular Shuffle button
         CircleIconButton(
             icon = BitChordIcons.Shuffle,
-            contentDescription = "Shuffle",
+            contentDescription = stringResource(R.string.shuffle),
             palette = palette,
             onClick = onShuffle,
+            haptic = Haptic.Resume,
         )
 
         PlayPill(
@@ -755,7 +1138,7 @@ private fun ActionRow(palette: ArtworkPalette, onPlay: () -> Unit, onShuffle: ()
             onClick = onPlay,
         )
     }
-    Spacer(Modifier.height(22.dp))
+    Spacer(Modifier.height(bottomSpace))
 }
 
 /**
@@ -769,13 +1152,19 @@ private fun PlayPill(
     modifier: Modifier = Modifier,
     horizontalPadding: Dp = 32.dp,
 ) {
+    // Resume rather than a flat tap: this button starts a queue, and the rising
+    // pair says so.
+    val haptics = rememberHaptics()
     Row(
         modifier = modifier
             .height(50.dp)
             .clip(CircleShape)
             .background(MaterialTheme.colorScheme.surface.copy(alpha = 0.6f))
             .border(0.5.dp, Color.White.copy(alpha = 0.10f), CircleShape)
-            .clickable(onClick = onClick)
+            .clickable {
+                haptics.play(Haptic.Resume)
+                onClick()
+            }
             .padding(horizontal = horizontalPadding),
         horizontalArrangement = Arrangement.Center,
         verticalAlignment = Alignment.CenterVertically,
@@ -788,7 +1177,7 @@ private fun PlayPill(
         )
         Spacer(Modifier.width(8.dp))
         Text(
-            text = "Play",
+            text = stringResource(R.string.play),
             style = MaterialTheme.typography.titleMedium,
             color = MaterialTheme.colorScheme.onSurface,
         )
@@ -805,21 +1194,27 @@ private fun CircleIconButton(
     contentDescription: String,
     palette: ArtworkPalette,
     onClick: () -> Unit,
+    haptic: Haptic = Haptic.Tap,
+    size: Dp = 50.dp,
 ) {
+    val haptics = rememberHaptics()
     Box(
         modifier = Modifier
-            .size(50.dp)
+            .size(size)
             .clip(CircleShape)
             .background(MaterialTheme.colorScheme.surface.copy(alpha = 0.6f))
             .border(0.5.dp, Color.White.copy(alpha = 0.10f), CircleShape)
-            .clickable(onClick = onClick),
+            .clickable {
+                haptics.play(haptic)
+                onClick()
+            },
         contentAlignment = Alignment.Center,
     ) {
         Icon(
             imageVector = icon,
             contentDescription = contentDescription,
             tint = MaterialTheme.colorScheme.onSurface,
-            modifier = Modifier.size(22.dp),
+            modifier = Modifier.size(size * 0.44f),
         )
     }
 }
@@ -833,6 +1228,117 @@ private fun ReleaseFooter(songs: List<Song>, palette: ArtworkPalette) {
         color = palette.onBackgroundVariant,
         modifier = Modifier.padding(start = HEADER_GUTTER, end = HEADER_GUTTER, top = 18.dp),
     )
+}
+
+/** "1.2M subscribers" and "3.4M monthly listeners", off the artist header. */
+@Composable
+private fun ArtistStatsRow(
+    subscriberCountText: String?,
+    monthlyListenerCount: String?,
+    palette: ArtworkPalette,
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            // Top padding is left to the header's own bottom inset (7.dp).
+            .padding(start = PAGE_GUTTER, end = PAGE_GUTTER, bottom = 14.dp),
+        horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.CenterHorizontally),
+    ) {
+        // YouTube's own count text already reads "1.2M subscribers" in full,
+        // so only the number is kept and the label re-said in the app's own
+        // words — the one way to fit both stats on one line on a narrow
+        // screen without either wrapping into two.
+        subscriberCountText?.let {
+            StatChip(
+                icon = Icons.Rounded.Person,
+                text = stringResource(R.string.subscribers, it.substringBefore(' ')),
+                palette = palette,
+            )
+        }
+        monthlyListenerCount?.let {
+            StatChip(
+                icon = Icons.Rounded.GraphicEq,
+                text = stringResource(R.string.monthly_listeners, it.substringBefore(' ')),
+                palette = palette,
+            )
+        }
+    }
+}
+
+@Composable
+private fun StatChip(icon: ImageVector, text: String, palette: ArtworkPalette) {
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        modifier = Modifier
+            .clip(CircleShape)
+            .background(MaterialTheme.colorScheme.surface.copy(alpha = 0.6f))
+            .border(0.5.dp, Color.White.copy(alpha = 0.10f), CircleShape)
+            .padding(horizontal = 12.dp, vertical = 6.dp),
+    ) {
+        Icon(
+            imageVector = icon,
+            contentDescription = null,
+            tint = palette.onBackgroundVariant,
+            modifier = Modifier.size(15.dp),
+        )
+        Spacer(Modifier.width(6.dp))
+        Text(
+            text = text,
+            style = MaterialTheme.typography.labelMedium,
+            color = palette.onBackgroundVariant,
+        )
+    }
+}
+
+/**
+ * YouTube's own editorial note for a release or an artist, collapsed to a
+ * few lines with a tap to read the rest — the same "About" block Apple
+ * Music and YouTube Music itself show under the header.
+ *
+ * Whether there's anything to expand is only knowable once the text has
+ * been laid out at the collapsed line count, so the "More" toggle is held
+ * back until that measurement says the clipped text actually lost
+ * something — otherwise a two-line bio would show a toggle with nothing
+ * behind it to reveal.
+ */
+@Composable
+private fun AboutSection(title: String, text: String, palette: ArtworkPalette) {
+    var expanded by remember(text) { mutableStateOf(false) }
+    var clipped by remember(text) { mutableStateOf(false) }
+    Column {
+        Text(
+            text = title,
+            style = MaterialTheme.typography.titleMedium,
+            color = palette.onBackground,
+            modifier = Modifier.padding(
+                start = ABOUT_GUTTER, end = ABOUT_GUTTER, top = 2.dp, bottom = 6.dp,
+            ),
+        )
+        Text(
+            text = text,
+            style = MaterialTheme.typography.bodyLarge,
+            fontWeight = FontWeight.Medium,
+            color = palette.onBackgroundVariant,
+            maxLines = if (expanded) Int.MAX_VALUE else 3,
+            overflow = TextOverflow.Ellipsis,
+            onTextLayout = { result -> if (!expanded) clipped = result.hasVisualOverflow },
+            modifier = Modifier
+                .fillMaxWidth()
+                .animateContentSize()
+                .padding(horizontal = ABOUT_GUTTER)
+                .let { m -> if (clipped || expanded) m.clickable { expanded = !expanded } else m },
+        )
+        if (clipped || expanded) {
+            Text(
+                text = stringResource(if (expanded) R.string.less else R.string.more),
+                style = MaterialTheme.typography.labelLarge,
+                color = palette.accent,
+                modifier = Modifier
+                    .padding(horizontal = ABOUT_GUTTER, vertical = 4.dp)
+                    .clickable { expanded = !expanded },
+            )
+        }
+    }
 }
 
 @Composable
@@ -856,6 +1362,7 @@ private fun CompactSongRow(
     palette: ArtworkPalette,
     onClick: () -> Unit,
     onLongPress: () -> Unit,
+    downloadedTint: Color? = null,
 ) {
     Row(
         modifier = Modifier
@@ -875,12 +1382,10 @@ private fun CompactSongRow(
         )
         Spacer(Modifier.width(12.dp))
         Column(Modifier.weight(1f)) {
-            Text(
-                text = song.title,
+            ExplicitSongTitle(
+                song = song,
                 style = MaterialTheme.typography.titleMedium,
                 color = palette.onBackground,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
             )
             Text(
                 text = song.artist,
@@ -889,6 +1394,9 @@ private fun CompactSongRow(
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
             )
+        }
+        if (downloadedTint != null) {
+            DownloadedBadge(song.videoId, downloadedTint)
         }
         Box(
             modifier = Modifier
@@ -899,7 +1407,7 @@ private fun CompactSongRow(
         ) {
             Icon(
                 Icons.Rounded.MoreVert,
-                contentDescription = "More",
+                contentDescription = stringResource(R.string.more),
                 tint = palette.onBackgroundVariant,
                 modifier = Modifier.size(20.dp),
             )
@@ -921,6 +1429,7 @@ private fun SuggestedSongRow(
     onClick: () -> Unit,
     onLongPress: () -> Unit,
     onAdd: () -> Unit,
+    downloadedTint: Color? = null,
 ) {
     Row(
         modifier = Modifier
@@ -940,12 +1449,10 @@ private fun SuggestedSongRow(
         )
         Spacer(Modifier.width(14.dp))
         Column(Modifier.weight(1f)) {
-            Text(
-                text = song.title,
+            ExplicitSongTitle(
+                song = song,
                 style = MaterialTheme.typography.titleMedium,
                 color = palette.onBackground,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
             )
             Spacer(Modifier.height(2.dp))
             Text(
@@ -955,6 +1462,9 @@ private fun SuggestedSongRow(
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
             )
+        }
+        if (downloadedTint != null) {
+            DownloadedBadge(song.videoId, downloadedTint)
         }
         Spacer(Modifier.width(8.dp))
         Box(
@@ -967,7 +1477,7 @@ private fun SuggestedSongRow(
         ) {
             Icon(
                 Icons.Rounded.Add,
-                contentDescription = "Add to playlist",
+                contentDescription = stringResource(R.string.add_to_playlist),
                 tint = palette.accent,
                 modifier = Modifier.size(20.dp),
             )
@@ -975,12 +1485,18 @@ private fun SuggestedSongRow(
     }
 }
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
-private fun SectionCard(item: ShelfItem, palette: ArtworkPalette, onClick: () -> Unit) {
+private fun SectionCard(
+    item: ShelfItem,
+    palette: ArtworkPalette,
+    onClick: () -> Unit,
+    onLongPress: (() -> Unit)? = null,
+) {
     Column(
         modifier = Modifier
             .width(SHELF_CARD_WIDTH)
-            .clickable(onClick = onClick),
+            .combinedClickable(onClick = onClick, onLongClick = onLongPress),
     ) {
         AsyncImage(
             model = item.thumbnailUrl.artworkAt(CARD_ART_PX),
@@ -1019,16 +1535,19 @@ private fun SectionCard(item: ShelfItem, palette: ArtworkPalette, onClick: () ->
  * it: the player knows an album's artist but not its year, search knows both,
  * and a home card frequently knows neither.
  */
+@Composable
 private fun DetailPage.headerLines(trackCount: Int): Pair<String, String> {
     val parts = subtitle.split("•", "·").map { it.trim() }.filter { it.isNotEmpty() }
     val year = parts.lastOrNull { it.length == 4 && it.all(Char::isDigit) }
-    val kind = parts.firstOrNull { it.lowercase() in KIND_WORDS }
+    val kind = parts.firstOrNull { it.lowercase(Locale.ROOT) in KIND_WORDS }
     val credit = parts.filter { it != year && it != kind }.joinToString(", ")
     val meta = listOfNotNull(
-        kind ?: type.label,
+        kind ?: type.localizedLabel(),
         year,
-        trackCount.takeIf { it > 0 }?.let { "$it ${if (it == 1) "song" else "songs"}" },
-    ).joinToString(" • ").uppercase()
+        trackCount.takeIf { it > 0 }?.let {
+            pluralStringResource(R.plurals.track_count_plural, it, it)
+        },
+    ).joinToString(" • ").uppercase(Locale.getDefault())
     return credit to meta
 }
 
@@ -1037,26 +1556,31 @@ private val KIND_WORDS = setOf(
     "album", "single", "ep", "playlist", "artist", "podcast", "episode", "song", "video",
 )
 
-private val BrowseType.label: String?
-    get() = when (this) {
-        BrowseType.ALBUM -> "Album"
-        BrowseType.PLAYLIST -> "Playlist"
-        BrowseType.ARTIST -> "Artist"
+@Composable
+private fun BrowseType.localizedLabel(): String? = when (this) {
+        BrowseType.ALBUM -> stringResource(R.string.album)
+        BrowseType.PLAYLIST -> stringResource(R.string.playlist)
+        BrowseType.ARTIST -> stringResource(R.string.artist)
         BrowseType.OTHER -> null
     }
 
 /** "12 songs, 41 minutes" — omitting the time when the rows carry no durations. */
+@Composable
 private fun List<Song>.playtimeSummary(): String {
-    val count = "$size ${if (size == 1) "song" else "songs"}"
+    val count = pluralStringResource(R.plurals.song_count_plural, size, size)
     val minutes = sumOf { it.durationText.toSeconds() } / 60
     return when {
         minutes <= 0 -> count
-        minutes < 60 -> "$count, $minutes minutes"
+        minutes < 60 -> stringResource(R.string.song_count_with_minutes, count, minutes)
         else -> {
             val hours = minutes / 60
             val rest = minutes % 60
-            val hourLabel = "$hours ${if (hours == 1) "hour" else "hours"}"
-            if (rest == 0) "$count, $hourLabel" else "$count, $hourLabel $rest minutes"
+            val hourLabel = pluralStringResource(R.plurals.hour_count, hours.toInt(), hours)
+            if (rest == 0) {
+                stringResource(R.string.song_count_with_duration, count, hourLabel)
+            } else {
+                stringResource(R.string.song_count_with_hours_minutes, count, hourLabel, rest)
+            }
         }
     }
 }
