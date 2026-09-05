@@ -18,6 +18,7 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.serialization.builtins.MapSerializer
@@ -443,12 +444,16 @@ object Downloads {
 
     /** Back to "not downloaded" — used for success, where [saved] takes over, and for cancellation. */
     private fun clear(videoId: String) {
-        _active.value = _active.value - videoId
+        _active.update { it - videoId }
+        DownloadSession.clear(videoId)
     }
 
     private fun fail(videoId: String, reason: String) {
-        _active.value = _active.value + (videoId to DownloadState.Failed(reason))
+        _active.update { it + (videoId to DownloadState.Failed(reason)) }
+        DownloadSession.failed(videoId, reason)
     }
+
+    private const val WIFI_ONLY_REFUSAL = "Downloads are only allowed over WiFi"
 
     /**
      * A failure a user can read. The message on an [error] raised in this
@@ -479,6 +484,7 @@ object Downloads {
      * simply do not have it.
      */
     private const val LOSSLESS_LOOKUP_MS = 20_000L
+    private val LOSSLESS_EXTENSIONS = listOf("flac", "alac", "dsd")
 
     /** Dropped when the sheet is reopened; a failure is worth showing once. */
     fun dismissFailure(videoId: String) {
