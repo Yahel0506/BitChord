@@ -9,6 +9,7 @@ import android.media.AudioManager
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.provider.Settings
 import android.view.View
 import android.window.OnBackInvokedCallback
@@ -30,6 +31,7 @@ import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
@@ -67,6 +69,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.layout.wrapContentWidth
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyListItemInfo
 import androidx.compose.foundation.lazy.LazyListState
@@ -120,6 +123,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.res.stringArrayResource
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.draw.drawWithContent
 import androidx.compose.ui.geometry.Offset
@@ -158,6 +162,7 @@ import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.TextLayoutResult
 import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.rememberTextMeasurer
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontWeight
@@ -186,7 +191,6 @@ import com.music.bitchord.data.NerdStats
 import com.music.bitchord.data.settings.TrackAnalysisState
 import com.music.bitchord.data.canvas.CanvasArtwork
 import com.music.bitchord.data.canvas.CanvasRepository
-import com.music.bitchord.data.canvas.CanvasSource
 import com.music.bitchord.data.lyrics.Genius
 import com.music.bitchord.data.lyrics.LyricLine
 import com.music.bitchord.data.lyrics.LyricsSource
@@ -194,6 +198,7 @@ import com.music.bitchord.ui.components.LyricsLogConsole
 import com.music.bitchord.data.settings.AppSettings
 import com.music.bitchord.data.settings.AudioQuality
 import com.music.bitchord.data.model.LikeStatus
+import com.music.bitchord.data.model.PLAYER_ART_PX
 import com.music.bitchord.data.model.Song
 import com.music.bitchord.data.model.artworkAt
 import com.music.bitchord.playback.BACK_RESTARTS_AFTER_MS
@@ -209,8 +214,26 @@ import kotlin.math.abs
 import kotlin.math.roundToInt
 
 /** Collapsed-header geometry, shared by the layout and its animation. */
-/** Comfortably over the sleeve's drawn size on a phone, without wasting bytes. */
-private const val ART_PX = 1200
+/**
+ * Comfortably over the sleeve's drawn size on a phone, without wasting bytes.
+ *
+ * A rung on the app-wide ladder rather than a number of the player's own, so a
+ * large home-screen widget asks for the same copy — see [PLAYER_ART_PX].
+ */
+private const val ART_PX = PLAYER_ART_PX
+
+/**
+ * How many further goes a cover that failed to load gets.
+ *
+ * Small on purpose. This is here for the connection that drops for a moment or
+ * the request that loses a race with the app coming back to the foreground, not
+ * for a track whose artwork has genuinely gone: past a few tries the answer is
+ * not going to change, and the placeholder tile is the honest thing to draw.
+ */
+private const val ART_RETRIES = 3
+
+/** How long to leave it before trying a failed cover again. */
+private const val ART_RETRY_DELAY_MS = 1_500L
 
 /**
  * How long a canvas lookup waits for the track's album name before giving up
@@ -272,11 +295,11 @@ private const val QUEUE_FLICK_VELOCITY = 450f
  *
  * It isn't the only place that does — the artwork and the credits under it pass
  * theirs on as well, which is what makes the whole top of the player closable
- * rather than just its topmost 44dp. See the dismiss band in `NowPlayingScreen`.
+ * rather than just its topmost 32dp. See the dismiss band in `NowPlayingScreen`.
  */
-private val DISMISS_STRIP_HEIGHT = 44.dp
+private val DISMISS_STRIP_HEIGHT = 32.dp
 /** The breathing room above the sleeve, needed twice: once to apply, once to measure past. */
-private val ART_BOX_TOP_PAD = 14.dp
+private val ART_BOX_TOP_PAD = 8.dp
 /**
  * Share of the motion-artwork banner's height given over to its dissolve.
  *
@@ -285,6 +308,17 @@ private val ART_BOX_TOP_PAD = 14.dp
  * that was cut off rather than one that ran out.
  */
 private const val HERO_FADE_FRACTION = 0.42f
+
+/**
+ * How often the backdrop re-reads the colours of a playing Canvas clip.
+ *
+ * Every three seconds, with `MESH_FADE_MS` easing each read into the last so
+ * the backdrop arrives at its new colour rather than cutting to it. The read is
+ * the expensive half — a texture readback off the GPU — and this is the number
+ * that decides how many of them there are; the fade is the cheap half and is
+ * over well inside the gap, which leaves the backdrop still for most of it.
+ */
+private const val MESH_REFRESH_MS = 3_000L
 
 /** The player's side margin. Scrollable panels reach back across it. */
 private val PLAYER_GUTTER = 30.dp
@@ -348,6 +382,24 @@ private val CONTROL_GAP_SPREAD_MAX = 48.dp
  * that is all it is, a cache of a measurement, not state anything observes.
  */
 private var lastControlSpread: Dp = 0.dp
+
+/**
+ * How long the shuffle glyph ignores further taps after one lands.
+ *
+ * Toggling shuffle rewrites the live queue one [Player.moveMediaItem] at a time,
+ * and every move runs the timeline listeners — the queue panel, the snapshot
+ * save, the notification. A held-down finger can post those faster than a frame
+ * takes to draw, and the whole player stutters. One tap is all a toggle can
+ * usefully mean anyway, so the rest are dropped rather than queued behind it.
+ */
+private const val SHUFFLE_TAP_WINDOW_MS = 400L
+/**
+ * The same gate for AutoPlay, held longer because its work is heavier: the
+ * toggle crosses to the playback service, tears down the in-flight suggestion
+ * load, and then either strips AutoPlay's tracks out of the queue or goes back
+ * to the network for a fresh set of them.
+ */
+private const val AUTOPLAY_TAP_WINDOW_MS = 700L
 
 /**
  * Whether the player is ever narrow enough in this window to run artwork edge to
@@ -585,11 +637,18 @@ fun NowPlayingScreen(
     val stillCovered by remember(song.videoId) {
         derivedStateOf { canvasCover.floatValue > 0.999f }
     }
-    val meshColors = rememberArtworkColors(song.thumbnailUrl, canvasFrame)
-    // Spotify's own Canvas, specifically — see CanvasArtworkPlayer's
-    // refreshFrameEveryMs for why this is scoped to that one source rather
-    // than asked of every clip.
-    val meshRefreshMs = if (canvas?.source == CanvasSource.SPOTIFY) 3_000L else null
+    // The backdrop's colours, taken off the artwork's own arrangement rather
+    // than quantised out of it — see [ArtworkMesh].
+    val artMesh = rememberArtworkMesh(song.thumbnailUrl, canvasFrame, ART_PX)
+    // Asked of every clip, Spotify's Canvas and every other source alike — see
+    // CanvasArtworkPlayer's refreshFrameEveryMs. A clip's own colours move as
+    // it plays regardless of who published it, and the backdrop should follow.
+    //
+    // Often enough that the backdrop moves with the clip rather than catching up
+    // with it every few seconds. What keeps that affordable is the size of each
+    // read, not the number of them: the frame comes back at `frameCapturePx`
+    // rather than full-bleed, and is averaged on a stride off the main thread.
+    val meshRefreshMs = MESH_REFRESH_MS
     LaunchedEffect(song.videoId, song.albumName, canvasAllowedNow) {
         if (!canvasAllowedNow) {
             canvas = null
@@ -681,6 +740,23 @@ fun NowPlayingScreen(
                         lyricsOpen = false
                     }
                 }
+            } else {
+                null
+            }
+            onDispose { OverlayBack.unregister(view, callback) }
+        }
+    }
+
+    // Back out of the queue to the player. Same problem as lyrics: the sheet's
+    // own dispatcher competes at PRIORITY_DEFAULT on API 33+, so we outrank it
+    // with an overlay-priority callback while the queue is open. Below 33 the
+    // BackHandler alone wins because it registers after the dialog's handler.
+    BackHandler(enabled = queueOpen) { queueOpen = false }
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+        val view = LocalView.current
+        DisposableEffect(view, queueOpen) {
+            val callback = if (queueOpen) {
+                OverlayBack.register(view) { queueOpen = false }
             } else {
                 null
             }
@@ -877,7 +953,63 @@ fun NowPlayingScreen(
     // full-bleed at once. Keyed on the cover there is nothing to reset: the
     // bitmap really is still loaded, so the state stays true and the two
     // layers go on trading places as they should.
-    var artLoaded by remember(song.artworkAt(ART_PX)) { mutableStateOf(false) }
+    val artUrl = song.artworkAt(ART_PX)
+    var artLoaded by remember(artUrl) { mutableStateOf(false) }
+    /**
+     * Which go at this cover we are on, and the reason there is more than one.
+     *
+     * Coil does not retry: a request that fails is over, and the state it leaves
+     * behind is the state this screen keeps until the model changes — which,
+     * keyed on the cover, means until the next track. One dropped connection at
+     * the wrong moment and the player showed its placeholder tile for a song it
+     * would have drawn perfectly a second later, with the widget and the
+     * notification both showing the cover from cache the whole time.
+     *
+     * Bounded and spaced, because the usual reason a cover fails is that there
+     * is no network at all, and a retry per recomposition — which is what an
+     * unremembered request effectively gave — is a spin, not a recovery.
+     */
+    var artAttempt by remember(artUrl) { mutableIntStateOf(0) }
+    /**
+     * The one request for this cover, built once.
+     *
+     * Both the sleeve and the full-bleed banner draw from it, which is what
+     * their own comments claim ("one ask, one decode, one bitmap for both") and
+     * what building it inline at each of them quietly failed to deliver: Coil
+     * compares models to decide whether to start a new load, and two separately
+     * built requests are never equal — `ImageRequest` has no `equals`, and
+     * neither does the size resolver `.size()` hands it. So each was its own
+     * load, and worse, *every recomposition* was another one. The player
+     * recomposes at least twice a second off the position tick, and each pass
+     * pushed the painter back through Loading before it settled on Success
+     * again, which is exactly the [artLoaded] this screen hangs the banner, the
+     * sleeve's alpha, its shadow and its placeholder icon on.
+     *
+     * Remembered on the cover and the attempt, so it changes when the picture
+     * changes and when a retry is deliberately asked for, and at no other time.
+     */
+    val artRequest = remember(artUrl, artAttempt) {
+        ImageRequest.Builder(context)
+            .data(artUrl)
+            .size(ART_PX)
+            // What makes a retry a new request as far as Coil's model comparison
+            // is concerned. Only from the second go onwards, so the ordinary
+            // request stays byte-identical to the one the mesh and the palette
+            // make of the same cover and goes on sharing their memory-cache
+            // entry. The disk key is unaffected either way.
+            .apply { if (artAttempt > 0) memoryCacheKeyExtra("attempt", artAttempt.toString()) }
+            .build()
+    }
+    var artFailed by remember(artUrl) { mutableStateOf(false) }
+    LaunchedEffect(artUrl, artFailed) {
+        // A track with no artwork at all fails immediately and would fail
+        // identically three more times: there is no request to make, so there is
+        // nothing a second go could do differently.
+        if (artUrl == null || !artFailed || artAttempt >= ART_RETRIES) return@LaunchedEffect
+        delay(ART_RETRY_DELAY_MS)
+        artFailed = false
+        artAttempt++
+    }
     // Sticky, unlike [artLoaded]: the banner is the shape of the player rather
     // than a property of the track in it. Waiting on each new cover would
     // collapse the banner into a card and blow it back out on every skip —
@@ -976,13 +1108,20 @@ fun NowPlayingScreen(
     var dismissBandSpace by remember { mutableStateOf<LayoutCoordinates?>(null) }
 
     Box(modifier = modifier.fillMaxSize()) {
-        // Keyed on the track: the backdrop drifts when the player opens and on
-        // every skip, then rests. Position ticks recompose this screen twice a
+        // Anchored to the sleeve's bottom edge, so the screen carries on in the
+        // colours the artwork ended in rather than in a quantiser's idea of what
+        // the artwork was about. Position ticks recompose this screen twice a
         // second and must not drag a full-screen blur along with them, which is
-        // why the palette is passed as one immutable value.
-        MeshGradientBackground(
-            palette = meshColors,
-            trackKey = song.videoId,
+        // why the mesh is passed as one immutable value.
+        //
+        // The seam is the *expanded* banner's bottom edge and is left there as
+        // the player collapses, rather than following the sleeve down: it is
+        // the anchor for a blurred layer, and moving it would re-blur the whole
+        // screen on every frame of the drag. Above it the mesh holds one colour,
+        // so a seam left behind a collapsed sleeve shows nothing at all.
+        ArtworkMeshBackdrop(
+            mesh = artMesh,
+            seam = if (heroMode) heroHeight else 0.dp,
         )
 
         // The artwork, edge to edge and running up behind the status bar,
@@ -1019,10 +1158,11 @@ fun NowPlayingScreen(
                     // cross-fade into each other, and asking twice at two sizes
                     // would decode the same art twice and let the banner fade in
                     // before its own copy had arrived.
-                    model = ImageRequest.Builder(context)
-                        .data(song.artworkAt(ART_PX))
-                        .size(ART_PX)
-                        .build(),
+                    //
+                    // Literally the same request object as the sleeve's, not an
+                    // identical one — see [artRequest] for why that distinction
+                    // is the whole of it.
+                    model = artRequest,
                     contentDescription = null,
                     contentScale = ContentScale.Crop,
                     modifier = Modifier
@@ -1119,11 +1259,11 @@ fun NowPlayingScreen(
                             // swiping the sleeve and tapping skip feel like one
                             // gesture with two spellings.
                             when {
-                                total <= -swipeThreshold && hasNext -> {
+                                total >= swipeThreshold && hasNext -> {
                                     haptics.play(Haptic.SkipNext)
                                     onNext()
                                 }
-                                total >= swipeThreshold && hasPrevious -> {
+                                total <= -swipeThreshold && hasPrevious -> {
                                     haptics.play(Haptic.SkipPrevious)
                                     onPrevious()
                                 }
@@ -1151,10 +1291,14 @@ fun NowPlayingScreen(
                 contentAlignment = Alignment.Center,
             ) {
                 if (!docked) {
+                    // Centred in the strip when it's the only thing there; nudged
+                    // up when the radio caption needs the room below it.
                     Box(
-                        Modifier
-                            .align(Alignment.TopCenter)
-                            .offset(y = 8.dp)
+                        (if (song.radioName != null) {
+                            Modifier.align(Alignment.TopCenter).offset(y = 6.dp)
+                        } else {
+                            Modifier.align(Alignment.Center)
+                        })
                             .width(38.dp)
                             .height(5.dp)
                             .clip(RoundedCornerShape(3.dp))
@@ -1403,12 +1547,38 @@ fun NowPlayingScreen(
                 // can simply be added back up rather than measured.
                 val bannerBottom = statusBarTop + topStrip + ART_BOX_TOP_PAD +
                     groupTop + fullArt + ART_TITLE_GAP / 2
+                // Held where it was while the lyrics are up.
+                //
+                // [groupTop] centres the block in this box's *real* height, and
+                // the lyrics panel changes that height without changing anything
+                // the block is made of: the spacers [controlSpread] feeds leave
+                // the tree, so the box comes back that much taller and the block
+                // is centred that much lower. [roomy] cancels it everywhere it
+                // is read, but the centring is not read from [roomy] — nor could
+                // it be, since [roomy] is deliberately the height the box *would*
+                // have, and the block has to sit in the one it has.
+                //
+                // Nothing on screen normally notices. Once a panel is up the
+                // sleeve is collapsed, so [artTop] and [titleTop] have both been
+                // lerped to zero and [groupTop] is left feeding exactly one
+                // thing: this. Which is the backdrop's anchor — so the whole mesh
+                // slid down by half the spread as the panel opened, up to 24dp.
+                // The queue never showed it because it leaves the controls, and
+                // so this box's height, exactly where they were.
+                //
+                // Frozen rather than corrected because the value is not in
+                // question — it is the same either side of the panel, and the
+                // sleeve it describes is not on screen to be re-measured while
+                // one is up. The first pass is exempt: a player composed with a
+                // panel already open has no earlier answer to hold on to.
+                //
                 // Guarded, like the spread above: this runs on every pass, and a
                 // state write from inside a layout is a recomposition asked for
                 // from inside a layout. Writing the same answer back costs a
                 // comparison here and a whole frame if it is left to the snapshot
                 // to notice.
-                if (bannerBottom != heroHeight) {
+                val bannerSettled = !lyricsOpen || heroHeight == 0.dp
+                if (bannerSettled && bannerBottom != heroHeight) {
                     SideEffect { heroHeight = bannerBottom }
                 }
 
@@ -1512,24 +1682,37 @@ fun NowPlayingScreen(
                             // banner makes, and the banner is taller than the
                             // sleeve is wide. One ask, one decode, one bitmap for
                             // both — and nothing to upscale when the two swap.
-                            model = ImageRequest.Builder(LocalContext.current)
-                                .data(song.artworkAt(ART_PX))
-                                .size(ART_PX)
-                                .build(),
+                            model = artRequest,
                             contentDescription = null,
                             // Video thumbnails are 16:9; letterboxing them inside
                             // the square sleeve looks like a broken frame.
                             contentScale = ContentScale.Crop,
-                            onState = { artLoaded = it is AsyncImagePainter.State.Success },
+                            onState = {
+                                artLoaded = it is AsyncImagePainter.State.Success
+                                // Only the failure is latched, and only upwards:
+                                // the retry that clears it is [artFailed]'s own
+                                // effect, and clearing it from a Loading state
+                                // here would cancel that effect's wait every time
+                                // the painter passed back through Loading.
+                                if (it is AsyncImagePainter.State.Error) artFailed = true
+                            },
                             // TextureView-backed canvas frames can arrive
-                            // before Coil has decoded the sleeve. Hide the
-                            // still layer for that short window: on some
-                            // devices Compose draws the image placeholder over
-                            // the Android view, leaving a blank square on top
-                            // of a perfectly healthy animated cover.
+                            // before Coil has decoded the sleeve. Alpha alone
+                            // doesn't hide this layer for that window: a
+                            // TextureView composites through its own hardware
+                            // layer, and on some devices that layer wins the
+                            // stacking order against a sibling Compose layer
+                            // even when that layer's alpha is zero — so the
+                            // still image's empty placeholder still shows
+                            // through, above a perfectly healthy animated
+                            // cover. Skipping the draw call outright leaves
+                            // nothing there to composite, in the wrong order
+                            // or otherwise; the request stays mounted so
+                            // loading still finishes in the background and
+                            // [artLoaded] still flips the moment it does.
                             modifier = Modifier
                                 .fillMaxSize()
-                                .graphicsLayer { alpha = if (!artLoaded && canvasRendered) 0f else 1f },
+                                .drawWithContent { if (artLoaded || !canvasRendered) drawContent() },
                         )
 
                         // Where the clip plays when it can't have the banner:
@@ -1647,7 +1830,7 @@ fun NowPlayingScreen(
                 val swipeHintProgress = (abs(swipeSettle) / swipeThreshold)
                     .coerceIn(0f, 1f) * (1f - p)
                 if (swipeHintProgress > 0.01f) {
-                    val showNext = swipeSettle < 0f
+                    val showNext = swipeSettle > 0f
                     val enabled = if (showNext) hasNext else hasPrevious
                     Icon(
                         imageVector = if (showNext) Icons.Rounded.FastForward else Icons.Rounded.FastRewind,
@@ -1681,25 +1864,44 @@ fun NowPlayingScreen(
                         // Shrinks as the header collapses, so the queue's
                         // heading doesn't have to compete with it.
                         val titleSize = lerp(20.sp, 16.sp, p)
-                        ExplicitSongTitle(
-                            song = song,
+                        // Only the title's own overflow gates the artist's stagger
+                        // below — an artist line that's long on its own has no
+                        // reason to wait on a title that already fits.
+                        var titleOverflowing by remember { mutableStateOf(false) }
+                        // Only while these credits are the screen. Collapsed into
+                        // a header over the queue or the lyrics they are a label
+                        // on a list, and a label that crawls pulls the eye off
+                        // whatever is being read below it.
+                        val scrolls = p < 0.01f
+                        MarqueeText(
+                            text = song.title,
                             style = MaterialTheme.typography.titleLarge.copy(
                                 fontSize = titleSize,
                             ),
                             color = Color.White,
+                            enabled = scrolls,
+                            leading = if (song.isExplicit == true) {
+                                { ExplicitBadge(color = Color.White) }
+                            } else {
+                                null
+                            },
+                            onOverflowChange = { titleOverflowing = it },
                             // Only the tracks YouTube hands us a browse id for
                             // lead anywhere; the rest stay plain text.
                             modifier = Modifier.opensPage(song.albumId, onOpenAlbum),
                         )
-                        Text(
+                        MarqueeText(
                             text = song.artist,
                             style = MaterialTheme.typography.titleLarge.copy(
                                 fontWeight = FontWeight.W500,
                                 fontSize = titleSize,
                             ),
                             color = Color.White.copy(alpha = 0.55f),
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis,
+                            enabled = scrolls,
+                            // A title that's also scrolling gets to go first —
+                            // starting together reads as clutter, so the artist
+                            // waits a beat before it joins in.
+                            startDelayMillis = if (titleOverflowing) MARQUEE_ARTIST_STAGGER_MS else 0L,
                             modifier = Modifier.opensPage(song.artistId, onOpenArtist),
                         )
                     }
@@ -1738,7 +1940,7 @@ fun NowPlayingScreen(
                         LyricsLogConsole(
                             modifier = Modifier
                                 .fillMaxSize()
-                                .padding(top = HEADER_HEIGHT + 10.dp)
+                                .padding(top = HEADER_HEIGHT)
                                 .graphicsLayer {
                                     alpha = ((p - 0.45f) / 0.55f).coerceIn(0f, 1f)
                                     translationY = (1f - p) * 26.dp.toPx()
@@ -1752,7 +1954,7 @@ fun NowPlayingScreen(
                             onSeekToLine = onSeek,
                             modifier = Modifier
                                 .fillMaxSize()
-                                .padding(top = HEADER_HEIGHT + 10.dp)
+                                .padding(top = HEADER_HEIGHT)
                                 // Arrives once the sleeve has finished collapsing
                                 // into the header, the same beat the queue below
                                 // already waits for — fading lyrics in over a
@@ -1772,7 +1974,7 @@ fun NowPlayingScreen(
                     Column(
                         modifier = Modifier
                             .fillMaxSize()
-                            .padding(top = HEADER_HEIGHT + 10.dp)
+                            .padding(top = HEADER_HEIGHT)
                             .graphicsLayer {
                                 alpha = ((queueProgress - 0.45f) / 0.55f).coerceIn(0f, 1f)
                                 translationY = (1f - queueProgress) * 26.dp.toPx()
@@ -2149,6 +2351,7 @@ fun NowPlayingScreen(
                     onClick = onToggleShuffle,
                     highlighted = shuffleEnabled,
                     haptic = if (shuffleEnabled) Haptic.ToggleOff else Haptic.ToggleOn,
+                    tapWindowMs = SHUFFLE_TAP_WINDOW_MS,
                 )
                 BottomGlyph(
                     icon = if (repeatMode == Player.REPEAT_MODE_ONE) null else BitChordIcons.Repeat,
@@ -2177,6 +2380,7 @@ fun NowPlayingScreen(
                     onClick = onToggleAutoplay,
                     highlighted = autoplayEnabled,
                     haptic = if (autoplayEnabled) Haptic.ToggleOff else Haptic.ToggleOn,
+                    tapWindowMs = AUTOPLAY_TAP_WINDOW_MS,
                 )
                 BottomGlyph(
                     icon = Icons.AutoMirrored.Rounded.QueueMusic,
@@ -3296,8 +3500,20 @@ private fun BottomGlyph(
     highlighted: Boolean = false,
     haptic: Haptic = Haptic.Tap,
     label: String? = null,
+    /**
+     * Shortest gap between taps that both reach [onClick]. A tap inside the
+     * window of the last one is dropped whole — haptic included, so a swallowed
+     * tap doesn't buzz as though something happened. The default lets every tap
+     * through: only the glyphs whose work is too heavy to repeat at finger speed
+     * ask for a window.
+     */
+    tapWindowMs: Long = 0L,
 ) {
     val haptics = rememberHaptics()
+    // Read only from the click handler, never during composition, so writing it
+    // costs no recomposition. Starts a full window in the past so the first tap
+    // is never the one that gets swallowed.
+    val lastTap = remember { mutableLongStateOf(-tapWindowMs) }
     Box(
         modifier = Modifier
             .size(44.dp)
@@ -3309,8 +3525,12 @@ private fun BottomGlyph(
                 interactionSource = remember { MutableInteractionSource() },
                 indication = null,
             ) {
-                haptics.play(haptic)
-                onClick()
+                val now = SystemClock.uptimeMillis()
+                if (now - lastTap.longValue >= tapWindowMs) {
+                    lastTap.longValue = now
+                    haptics.play(haptic)
+                    onClick()
+                }
             }
             .semantics { this.contentDescription = contentDescription },
         contentAlignment = Alignment.Center,
@@ -3363,6 +3583,147 @@ private fun Modifier.opensPage(browseId: String?, onOpen: (String) -> Unit): Mod
     } else {
         clip(RoundedCornerShape(6.dp)).clickable { onOpen(browseId) }
     }
+
+/** How fast the title/artist marquee crawls — unhurried, not a ticker. */
+private const val MARQUEE_DP_PER_SEC = 26f
+
+/** Clear air between the tail of the line and the copy chasing it round. */
+private val MARQUEE_GAP = 48.dp
+
+/** How long a line sits back at its start before the next pass — the "5 seconds" rest. */
+private const val MARQUEE_REST_MS = 5_000L
+
+/** Artist's head start is ceded to the title when both are scrolling, so they don't start as one block. */
+private const val MARQUEE_ARTIST_STAGGER_MS = 3_000L
+
+/**
+ * A single line of text that scrolls in place, only when it is too long for
+ * [modifier]'s width to show in full.
+ *
+ * Idle text never animates — the scroll only kicks in once measurement proves
+ * an ellipsis would otherwise be needed. When it does, the line is drawn twice
+ * with [MARQUEE_GAP] between the copies and the pair is crawled leftwards by
+ * exactly one copy-plus-gap: the trailing copy chases the leading one in from
+ * the right and lands precisely where it started, so the offset reset at the
+ * end of the pass falls under a copy already in position and cannot be seen.
+ * The line therefore only ever travels one way — right to left, round and back
+ * to its resting place — rather than bouncing back the way it came.
+ *
+ * A pass is: wait [startDelayMillis] (used to stagger the artist line behind
+ * the title), crawl one full loop, then rest [MARQUEE_REST_MS] at the start
+ * before going again. [onOverflowChange] reports whether this line is scrolling
+ * at all, so a sibling line can decide whether it needs to stagger behind it.
+ *
+ * With [enabled] false the line is a plain ellipsised one — no copies, no
+ * animation, nothing left running off screen.
+ */
+@Composable
+private fun MarqueeText(
+    text: String,
+    style: TextStyle,
+    color: Color,
+    modifier: Modifier = Modifier,
+    enabled: Boolean = true,
+    startDelayMillis: Long = 0L,
+    leading: (@Composable () -> Unit)? = null,
+    onOverflowChange: (Boolean) -> Unit = {},
+) {
+    val density = LocalDensity.current
+    val textMeasurer = rememberTextMeasurer()
+    Row(modifier = modifier, verticalAlignment = Alignment.CenterVertically) {
+        if (leading != null) {
+            leading()
+            Spacer(Modifier.width(6.dp))
+        }
+        if (!enabled) {
+            Text(
+                text = text,
+                style = style,
+                color = color,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.weight(1f, fill = false),
+            )
+            return@Row
+        }
+        BoxWithConstraints(Modifier.weight(1f, fill = false).clipToBounds()) {
+            val maxWidthPx = constraints.maxWidth
+            val layout = remember(text, style, maxWidthPx) {
+                textMeasurer.measure(text = text, style = style, maxLines = 1, softWrap = false)
+            }
+            val overflowing = layout.size.width > maxWidthPx
+            LaunchedEffect(overflowing) { onOverflowChange(overflowing) }
+
+            // One whole copy plus the gap behind it: that is the distance at
+            // which the second copy is sitting exactly where the first was.
+            val travelPx = if (overflowing) {
+                layout.size.width + with(density) { MARQUEE_GAP.roundToPx() }
+            } else {
+                0
+            }
+
+            val offsetX = remember { Animatable(0f) }
+            LaunchedEffect(text, travelPx, startDelayMillis) {
+                offsetX.snapTo(0f)
+                if (travelPx <= 0) return@LaunchedEffect
+                val pxPerMs = with(density) { MARQUEE_DP_PER_SEC.dp.toPx() } / 1000f
+                val scrollMs = (travelPx / pxPerMs).roundToInt().coerceAtLeast(400)
+                delay(startDelayMillis)
+                while (true) {
+                    offsetX.animateTo(-travelPx.toFloat(), tween(scrollMs, easing = LinearEasing))
+                    // Invisible: the trailing copy has arrived at the leading
+                    // one's starting mark, so the line is already back where
+                    // this puts it.
+                    offsetX.snapTo(0f)
+                    delay(MARQUEE_REST_MS)
+                }
+            }
+
+            Row(
+                // Measured unbounded so the copies actually lay out at their
+                // full width, wider than the clipped box around them — bounded,
+                // the text is truncated during its own measurement and sliding
+                // it sideways just moves an already-cut string.
+                modifier = Modifier
+                    .wrapContentWidth(align = Alignment.Start, unbounded = true)
+                    .offset { IntOffset(offsetX.value.roundToInt(), 0) },
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                MarqueeLine(text = text, style = style, color = color)
+                if (overflowing) {
+                    Spacer(Modifier.width(MARQUEE_GAP))
+                    MarqueeLine(text = text, style = style, color = color)
+                }
+            }
+        }
+    }
+}
+
+/** One copy of a marquee's line, laid out at its full width rather than clipped. */
+@Composable
+private fun MarqueeLine(text: String, style: TextStyle, color: Color) {
+    Text(
+        text = text,
+        style = style,
+        color = color,
+        maxLines = 1,
+        softWrap = false,
+        overflow = TextOverflow.Clip,
+    )
+}
+
+/** The small "E" pill for explicit tracks, kept outside the scrolling text. */
+@Composable
+private fun ExplicitBadge(color: Color) {
+    Text(
+        text = "E",
+        style = MaterialTheme.typography.labelSmall,
+        color = color,
+        modifier = Modifier
+            .border(1.dp, color.copy(alpha = 0.72f), RoundedCornerShape(2.dp))
+            .padding(horizontal = 3.dp),
+    )
+}
 
 /**
  * Measure a child wider than its slot by [gutter] on each side and place it back
@@ -4133,10 +4494,11 @@ private fun formatTime(ms: Long): String {
 
 /**
  * The gap between the two timestamps under the seek bar: just the "Lossless"
- * badge when one applies, and nothing otherwise. The measured stats line
- * that used to fall back to lives inside the sleeve now (see the bottom-centre
- * overlay on the artwork Box above), so there is no tap here to swap it in —
- * the badge is a claim, the sleeve is where the evidence is.
+ * badge when one applies, and nothing otherwise. The stats line that used to
+ * fall back to lives inside the sleeve now (see the bottom-centre overlay on
+ * the artwork Box above), so there is no tap here to swap it in — the two say
+ * the same thing at different resolutions, both read off the stream being
+ * decoded rather than off what a source offered to send.
  */
 @Composable
 private fun LosslessOrStats(
@@ -4181,10 +4543,11 @@ private fun LosslessOrStats(
             //
             // Decided on [NerdStats.Snapshot.isHiQuality] rather than on which
             // source won, for the reason that property already gives: a
-            // 320kbps stream is a 320kbps stream wherever it came from. It
-            // reads the claimed rate when nothing is measured yet, so a
-            // JioSaavn stream qualifies from its first frame; YouTube's Opus
-            // sits under the threshold and keeps the plain label it had.
+            // 320kbps stream is a 320kbps stream wherever it came from. It is
+            // read off the stream rather than off what the module offered, so
+            // a JioSaavn AAC qualifies once its container has stated its rate;
+            // YouTube's Opus sits under the threshold and keeps the plain
+            // label it had.
             text = if (nerdStats?.isHiQuality == true) {
                 stringResource(R.string.high_quality_upgrading)
             } else {
@@ -4315,14 +4678,17 @@ private fun ShimmerText(text: String) {
 }
 
 /**
- * "FLAC · 24-bit · 96.0 kHz · Stereo" — whichever of those the player has
- * actually reported. A figure it hasn't is dropped rather than filled in, so a
- * short line means little was known, never that something was invented.
+ * "FLAC · 24-bit · 96.0 kHz · 4608 kbps · Stereo" — whichever of those the
+ * player has actually reported. A figure it hasn't is dropped rather than
+ * filled in, so a short line means little was known, never that something was
+ * invented.
  *
- * Bitrate is omitted once the stream is known to be lossless: the number is
- * real but says nothing useful about the quality, and reading "1411 kbps" next
- * to "FLAC" invites the comparison with a lossy figure that the two do not
- * support.
+ * Bitrate is stated for a lossless stream too, and is the rate its samples
+ * decode to — 1411 for 16-bit/44.1kHz, 4608 for 24-bit/96kHz. It is the same
+ * figure Tidal, Qobuz and Apple Music print next to a lossless track, and the
+ * one a listener can carry from track to track; a FLAC's compressed rate
+ * cannot, because it says more about how compressible that recording was than
+ * about the copy being played.
  *
  * A stream that arrived worse than its source promised gets that stated
  * outright rather than left to be spotted — see [NerdStats.Snapshot.downgraded].
@@ -4331,8 +4697,8 @@ private fun NerdStats.Snapshot.describe(context: android.content.Context): Strin
     val parts = buildList {
         codecLabel(mimeType)?.let(::add)
         bitDepth?.let { add(context.getString(R.string.bit_depth, it)) }
-        if (!isLossless) bitrateKbps?.let { add("$it kbps") }
         sampleRateHz?.let { add("%.1f kHz".format(Locale.ROOT, it / 1000f)) }
+        bitrateKbps?.let { add("$it kbps") }
         channels?.let {
             add(
                 when (it) {

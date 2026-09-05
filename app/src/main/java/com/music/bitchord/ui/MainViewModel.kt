@@ -41,6 +41,7 @@ import com.music.bitchord.data.model.SearchResult
 import com.music.bitchord.data.model.ShelfItem
 import com.music.bitchord.data.model.Song
 import com.music.bitchord.data.model.SongMenu
+import com.music.bitchord.data.model.SubscriptionState
 import com.music.bitchord.data.model.UiState
 import com.music.bitchord.data.model.UserPlaylist
 import com.music.bitchord.data.settings.SearchHistory
@@ -99,7 +100,19 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     private val homeSeenTitles = mutableSetOf<String>()
 
     private val _homeLoadingMore = MutableStateFlow(false)
-    val homeLoadingMore: StateFlow<Boolean> = _homeLoadingMore.asStateFlow()
+
+    /**
+     * Requests still filling out the first Play page. The core feed and each
+     * supplement browse run in parallel and publish as they land, so the list
+     * goes Success while several shelves are still on the wire — counted here
+     * so the feed can say more is coming instead of just ending mid-load.
+     */
+    private val _homePendingShelves = MutableStateFlow(0)
+
+    /** True whenever shelves are still due at the end of the feed, from either source. */
+    val homeLoadingMore: StateFlow<Boolean> =
+        combine(_homeLoadingMore, _homePendingShelves) { paging, pending -> paging || pending > 0 }
+            .stateIn(viewModelScope, SharingStarted.Eagerly, false)
 
     private val _homeRecentlyPlayedLoading = MutableStateFlow(false)
     val homeRecentlyPlayedLoading: StateFlow<Boolean> = _homeRecentlyPlayedLoading.asStateFlow()
@@ -548,6 +561,41 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 libraryStale = true
             } else {
                 setSavedOnPage(browseId, current.saved)
+            }
+        }
+    }
+
+    /**
+     * Subscribes to the artist page [browseId]'s channel, or unsubscribes.
+     *
+     * The release equivalent is [toggleLibrary], and this behaves the same way:
+     * optimistic, rolled back on refusal, and a no-op on a page whose header
+     * never offered a subscribe button — a signed-out response among them.
+     */
+    fun toggleSubscription(browseId: String) {
+        if (!requireSignIn()) return
+        val current = _detailStack.value
+            .firstOrNull { it.browseId == browseId }?.subscription ?: return
+        val target = !current.subscribed
+        setSubscribedOnPage(browseId, target)
+        viewModelScope.launch {
+            if (YtMusicRepository.setSubscribed(current.channelId, target).isSuccess) {
+                // The Library tab's Subscriptions shelf is now out of date.
+                libraryStale = true
+            } else {
+                setSubscribedOnPage(browseId, current.subscribed)
+            }
+        }
+    }
+
+    /** As [setSavedOnPage], for the artist header's subscribe button. */
+    private fun setSubscribedOnPage(browseId: String, subscribed: Boolean) {
+        _detailStack.value = _detailStack.value.map { page ->
+            val subscription = page.subscription
+            if (page.browseId != browseId || subscription == null) {
+                page
+            } else {
+                page.copy(subscription = subscription.copy(subscribed = subscribed))
             }
         }
     }
@@ -1208,19 +1256,27 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         homeSeenTitles.clear()
         _homeLoadingMore.value = false
         _homeRecentlyPlayedLoading.value = _signedIn.value
+        // The core feed plus one browse per supplement. Recently played is left
+        // out: it has its own skeleton at the head of the page rather than the
+        // one at the tail.
+        _homePendingShelves.value = 1 + YtMusicRepository.HOME_SUPPLEMENT_BROWSE_IDS.size
         viewModelScope.launch {
             launch {
-                YtMusicRepository.home()
-                    .onSuccess { feed ->
-                        if (!isCurrentHomeLoad(identity, generation)) return@onSuccess
-                        homeContinuation = feed.continuation
-                        publishHomeShelves(feed.shelves)
-                    }
-                    .onFailure { failure ->
-                        if (isCurrentHomeLoad(identity, generation) && _home.value !is UiState.Success) {
-                            _home.value = UiState.Error(failure.friendly())
+                try {
+                    YtMusicRepository.home()
+                        .onSuccess { feed ->
+                            if (!isCurrentHomeLoad(identity, generation)) return@onSuccess
+                            homeContinuation = feed.continuation
+                            publishHomeShelves(feed.shelves)
                         }
-                    }
+                        .onFailure { failure ->
+                            if (isCurrentHomeLoad(identity, generation) && _home.value !is UiState.Success) {
+                                _home.value = UiState.Error(failure.friendly())
+                            }
+                        }
+                } finally {
+                    homeShelfRequestSettled(identity, generation)
+                }
             }
             if (_signedIn.value) {
                 launch {
@@ -1238,12 +1294,25 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             }
             YtMusicRepository.HOME_SUPPLEMENT_BROWSE_IDS.forEach { browseId ->
                 launch {
-                    YtMusicRepository.homeSupplement(browseId).onSuccess { shelves ->
-                        if (isCurrentHomeLoad(identity, generation)) publishHomeShelves(shelves)
+                    try {
+                        YtMusicRepository.homeSupplement(browseId).onSuccess { shelves ->
+                            if (isCurrentHomeLoad(identity, generation)) publishHomeShelves(shelves)
+                        }
+                    } finally {
+                        homeShelfRequestSettled(identity, generation)
                     }
                 }
             }
         }
+    }
+
+    /**
+     * One of the parallel first-page requests has finished. Ignored once a newer
+     * load has taken over, which has already reset the count for its own fan-out.
+     */
+    private fun homeShelfRequestSettled(identity: String?, generation: Long) {
+        if (!isCurrentHomeLoad(identity, generation)) return
+        _homePendingShelves.value = (_homePendingShelves.value - 1).coerceAtLeast(0)
     }
 
     private fun isCurrentHomeLoad(identity: String?, generation: Long) =
@@ -1629,13 +1698,18 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
      *
      * Only the Songs filter fans out: albums, artists and playlists are
      * browse-shaped, and [MusicSource] deliberately answers for tracks only.
+     *
+     * Asked of the playback list rather than every enabled source, so a result
+     * offered here is one this connection's ceiling would actually let play —
+     * a row that can only be tapped into a YouTube stream is a lie about where
+     * the track is coming from.
      */
     private suspend fun sourceResults(
         query: String,
         filter: SearchFilter,
     ): Pair<List<SearchResult>, List<SearchResult>> = coroutineScope {
         if (filter != SearchFilter.SONGS) return@coroutineScope emptyList<SearchResult>() to emptyList()
-        val active = SourceRegistry.active()
+        val active = SourceRegistry.activeForPlayback()
         val youtubeRank = active.indexOfFirst { it.kind == SourceKind.YOUTUBE }
             .let { if (it < 0) active.size else it }
 
@@ -1804,6 +1878,8 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             /** Artist header stats — see [DetailPage.subscriberCountText]. */
             var subscriberCountText: String? = null
             var monthlyListenerCount: String? = null
+            /** Whether this artist is subscribed to — see [DetailPage.subscription]. */
+            var subscription: SubscriptionState? = null
             val state = when {
                 Downloads.recordIdOf(browseId) != null -> {
                     val songs = downloadedPlaylist(browseId)
@@ -1835,6 +1911,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                             description = page.description
                             subscriberCountText = page.subscriberCountText
                             monthlyListenerCount = page.monthlyListenerCount
+                            subscription = page.subscription
                             if (page.songs.isEmpty()) {
                                 UiState.Error(text(R.string.no_tracks_here))
                             } else {
@@ -1896,6 +1973,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                         description = description,
                         subscriberCountText = subscriberCountText,
                         monthlyListenerCount = monthlyListenerCount,
+                        subscription = subscription,
                     )
                 } else {
                     it

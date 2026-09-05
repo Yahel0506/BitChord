@@ -37,6 +37,7 @@ import androidx.compose.material.icons.rounded.Downloading
 import androidx.compose.material.icons.rounded.ErrorOutline
 import androidx.compose.material.icons.rounded.Favorite
 import androidx.compose.material.icons.rounded.FavoriteBorder
+import androidx.compose.material.icons.rounded.HighQuality
 import androidx.compose.material.icons.rounded.Person
 import androidx.compose.material.icons.rounded.Radio
 import androidx.compose.material.icons.rounded.PlaylistRemove
@@ -130,8 +131,21 @@ fun SongActionsSheet(
     modifier: Modifier = Modifier,
     onRemoveFromPlaylist: (() -> Unit)? = null,
     showSleepTimer: Boolean = false,
-    /** Available only for a player item currently replaced by a quality upgrade. */
+    /**
+     * Sends the playing track back to YouTube's own upload, and keeps it there.
+     * Offered for any player item that has one behind it — a substituted copy
+     * can be the wrong recording from the first second, not only after a
+     * visible upgrade. See
+     * [com.music.bitchord.playback.hasYouTubeOriginal].
+     */
     onRollbackToOriginal: (() -> Unit)? = null,
+    /**
+     * The way back from a revert: available only for a player item the listener
+     * has pinned to YouTube's own upload, where nothing will go looking for a
+     * better copy again until they ask.
+     * See [com.music.bitchord.playback.OriginalVersion].
+     */
+    onUpgradeQuality: (() -> Unit)? = null,
     onShare: (() -> Unit)? = null,
     /**
      * Copies what the app logged while starting this track. Null everywhere
@@ -168,13 +182,29 @@ fun SongActionsSheet(
         SheetTrackHeader(song, subtitleColor = palette.onBackgroundVariant)
         HorizontalDivider(thickness = 0.5.dp, color = palette.divider)
 
-        // Leads the list whenever it's available: it answers the one
-        // question a quality-upgraded track raises above all the others
-        // here, so it shouldn't be buried under rows that apply every time.
-        onRollbackToOriginal?.let {
+        // Leads the list whenever it's available: which recording is playing
+        // is the one question that has to be answered before any of the rows
+        // below mean anything — there is no point rating, queueing or
+        // downloading the wrong version of a song.
+        //
+        // The two are never both present — one is offered for a track playing
+        // a substituted copy, the other for a track held on YouTube's own —
+        // and between them they are the whole of the choice, which is why they
+        // sit in the same place under the same divider.
+        (onRollbackToOriginal ?: onUpgradeQuality)?.let {
             ActionRow(
-                icon = Icons.AutoMirrored.Rounded.Undo,
-                label = stringResource(R.string.revert_to_original),
+                icon = if (onRollbackToOriginal != null) {
+                    Icons.AutoMirrored.Rounded.Undo
+                } else {
+                    Icons.Rounded.HighQuality
+                },
+                label = stringResource(
+                    if (onRollbackToOriginal != null) {
+                        R.string.revert_to_original
+                    } else {
+                        R.string.upgrade_quality
+                    },
+                ),
                 accent = palette.accent,
                 onClick = it,
             )

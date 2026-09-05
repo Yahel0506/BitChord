@@ -35,6 +35,8 @@
     <string name="add_to_playlist">Add to playlist</string>
     <string name="add_to_library">Add to library</string>
     <string name="remove_from_library">Remove from library</string>
+    <string name="subscribe">Subscribe</string>
+    <string name="unsubscribe">Unsubscribe</string>
     <string name="download_all">Download all</string>
     <string name="top_songs">Top songs</string>
     <string name="suggested">Suggested</string>
@@ -124,6 +126,7 @@
     <string name="play_next">Play next</string>
     <string name="queue">Queue</string>
     <string name="source_setup_required">Tap to finish setting up</string>
+    <string name="source_skipped_by_quality">Not used on %1$s · quality is set to %2$s</string>
     <string name="source_unreachable">Can’t reach it right now · %1$s</string>
     <string name="checking">Checking…</string>
     <string name="failed">Failed</string>
@@ -145,6 +148,10 @@
     <string name="convert_to_audio">Convert to audio</string>
     <string name="converting_to_audio">Converting to audio…</string>
     <string name="revert_to_original">Revert to original</string>
+    <string name="upgrade_quality">Upgrade quality</string>
+    <string name="dolby_atmos">Dolby Atmos</string>
+    <string name="dolby_atmos_subtitle">Play the more immersive, surround version of a song when there is one.</string>
+    <string name="dolby_atmos_unavailable">This device can\'t play Atmos, so these songs play in their usual version</string>
     <string name="spatial_audio">Spatial audio</string>
     <string name="spatial_audio_subtitle">Widens stereo tracks for a more immersive feel</string>
     <string name="animated_cover_cellular">Play animated cover over cellular</string>

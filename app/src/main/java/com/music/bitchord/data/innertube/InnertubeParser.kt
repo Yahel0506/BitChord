@@ -14,11 +14,13 @@ import com.music.bitchord.data.model.SearchResult
 import com.music.bitchord.data.model.ShelfItem
 import com.music.bitchord.data.model.Song
 import com.music.bitchord.data.model.SongMenu
+import com.music.bitchord.data.model.SubscriptionState
 import com.music.bitchord.data.model.UserPlaylist
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.booleanOrNull
 import kotlinx.serialization.json.contentOrNull
 import java.util.Locale
 
@@ -323,7 +325,42 @@ object InnertubeParser {
             description = parseDescription(response),
             subscriberCountText = subscriberCount(header),
             monthlyListenerCount = monthlyListeners(header),
+            subscription = subscription(header),
         )
+    }
+
+    /**
+     * The header's subscribe button, as state rather than as a label — see
+     * [SubscriptionState].
+     *
+     * Same two shapes [subscriberCount] has to cope with, and read in the same
+     * order. The channel id is taken off the button rather than off the browse
+     * id the page was fetched with: they are usually the same `UC…`, but a page
+     * reached through one of YouTube's aliases is the case where they aren't,
+     * and the button is the side that knows what it would act on.
+     */
+    private fun subscription(header: JsonElement?): SubscriptionState? {
+        val immersive = header.o("musicImmersiveHeaderRenderer") ?: return null
+        // Both shapes are tried rather than the first one found being trusted:
+        // the newer button is sometimes only the count, and a page that ships
+        // both is one where the state is on the other one.
+        return listOfNotNull(
+            immersive.o("subscriptionButton2").o("subscribeButtonRenderer"),
+            immersive.o("subscriptionButton").o("subscribeButtonRenderer"),
+        ).firstNotNullOfOrNull { button ->
+            // Absent on a signed-out response, where the button is only ever an
+            // invitation to sign in and toggling it would be a write with
+            // nothing behind it.
+            val subscribed = (button["subscribed"] as? JsonPrimitive)?.booleanOrNull
+                ?: return@firstNotNullOfOrNull null
+            val channelId = button.s("channelId")
+                ?: button.a("serviceEndpoints")?.firstNotNullOfOrNull { endpoint ->
+                    (endpoint.o("subscribeEndpoint").a("channelIds")?.firstOrNull()
+                        as? JsonPrimitive)?.contentOrNull
+                }
+                ?: return@firstNotNullOfOrNull null
+            SubscriptionState(channelId = channelId, subscribed = subscribed)
+        }
     }
 
     /**
@@ -534,7 +571,20 @@ object InnertubeParser {
         val subtitle = columns.getOrNull(1)
             .o("musicResponsiveListItemFlexColumnRenderer").o("text").runs()
         val parts = subtitle.split(" • ").filter { it.isNotBlank() }
+        // A search row states its runtime in the subtitle; an album's own rows
+        // do not — the release is billed once in the header and the per-track
+        // duration sits in a `fixedColumns` entry off to the right instead.
+        // Nothing here read that column, so every track parsed off an album page
+        // came back with a null duration, and two things downstream quietly got
+        // worse for it: [LyricsTag.forTrack] fell back to matching on title and
+        // artist alone against providers that key on runtime, and
+        // [TrackMatcher] lost the one check that separates the album cut from
+        // the extended mix sitting beside it in a source's search results.
         val duration = parts.lastOrNull()?.takeIf { it.matches(DURATION) }
+            ?: renderer.a("fixedColumns").orEmpty().firstNotNullOfOrNull { column ->
+                column.o("musicResponsiveListItemFixedColumnRenderer")
+                    .o("text").runs().takeIf { it.matches(DURATION) }
+            }
         // On the "All" tab the first segment is the row type ("Song", "Video"),
         // not the artist — skip those so the subtitle reads like a credit.
         val rowType = parts.firstOrNull { it.lowercase(Locale.ROOT) in TYPE_WORDS }?.lowercase(Locale.ROOT)

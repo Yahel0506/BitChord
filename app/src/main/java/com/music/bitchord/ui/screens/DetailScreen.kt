@@ -89,8 +89,10 @@ import com.music.bitchord.data.model.HEADER_ART_PX
 import com.music.bitchord.data.model.ROW_ART_PX
 import com.music.bitchord.data.model.ShelfItem
 import com.music.bitchord.data.model.Song
+import com.music.bitchord.data.model.SubscriptionState
 import com.music.bitchord.data.model.UiState
 import com.music.bitchord.data.model.artworkAt
+import com.music.bitchord.data.model.isSameTrackAs
 import com.music.bitchord.data.settings.AppSettings
 import com.music.bitchord.ui.components.ArtworkWash
 import com.music.bitchord.ui.components.DownloadedBadge
@@ -222,6 +224,13 @@ fun DetailScreen(
      * wouldn't just be refused.
      */
     onToggleLibrary: (() -> Unit)? = null,
+    /**
+     * Subscribes to this artist's channel, or unsubscribes —
+     * [DetailPage.subscription] says which way round. The artist page's answer
+     * to [onToggleLibrary], and null in the same circumstances: a guest, or a
+     * page whose header never offered the button.
+     */
+    onToggleSubscription: (() -> Unit)? = null,
     /**
      * How the track list is ordered — the release's own running order by
      * default, or alphabetical. Owned by the caller rather than this page
@@ -408,6 +417,8 @@ fun DetailScreen(
                         palette = palette,
                         onPlay = { onSongClick(songs, 0) },
                         onShuffle = { onShuffle(songs) },
+                        subscription = page.subscription?.takeIf { onToggleSubscription != null },
+                        onToggleSubscription = onToggleSubscription,
                         // Halved when an About section follows directly — see
                         // [AboutSection]'s own top inset, which makes up the
                         // rest of that shorter gap.
@@ -473,7 +484,7 @@ fun DetailScreen(
                     }
                     itemsIndexed(matches) { position, entry ->
                         val song = entry.value
-                        val isCurrent = song.isSameQueueEntry(currentSong)
+                        val isCurrent = song.isSameTrackAs(currentSong)
                         SongRow(
                             song = if (numbered) {
                                 song
@@ -556,20 +567,6 @@ fun DetailScreen(
             }
         }
     }
-}
-
-/**
- * Playlist entries have their own identity because the same recording can be
- * added more than once. Fall back to media identity for albums and local rows,
- * which do not carry a set-video-id.
- */
-private fun Song.isSameQueueEntry(current: Song?): Boolean {
-    current ?: return false
-    if (setVideoId != null && current.setVideoId != null) {
-        return setVideoId == current.setVideoId
-    }
-    if (localUri != null && current.localUri != null) return localUri == current.localUri
-    return videoId == current.videoId
 }
 
 /**
@@ -1102,6 +1099,9 @@ private fun ActionRow(
     onPlay: () -> Unit,
     onShuffle: () -> Unit,
     bottomSpace: Dp = 22.dp,
+    /** The artist header's subscribe state, or null where it isn't offered. */
+    subscription: SubscriptionState? = null,
+    onToggleSubscription: (() -> Unit)? = null,
 ) {
     Row(
         modifier = Modifier
@@ -1110,6 +1110,20 @@ private fun ActionRow(
         horizontalArrangement = Arrangement.spacedBy(10.dp, Alignment.CenterHorizontally),
         verticalAlignment = Alignment.CenterVertically,
     ) {
+        // Subscribing sits where saving does on a release — first circle, left
+        // of Shuffle — and says the same thing with the same pair of icons.
+        if (subscription != null) {
+            CircleIconButton(
+                icon = if (subscription.subscribed) BitChordIcons.Check else BitChordIcons.Plus,
+                contentDescription = stringResource(
+                    if (subscription.subscribed) R.string.unsubscribe else R.string.subscribe,
+                ),
+                palette = palette,
+                onClick = { onToggleSubscription?.invoke() },
+                haptic = if (subscription.subscribed) Haptic.ToggleOff else Haptic.ToggleOn,
+            )
+        }
+
         // Circular Shuffle button
         CircleIconButton(
             icon = BitChordIcons.Shuffle,

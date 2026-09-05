@@ -129,6 +129,7 @@ import com.music.bitchord.ui.screens.SourcesScreen
 import com.music.bitchord.ui.screens.SpotifyCanvasAuthScreen
 import com.music.bitchord.playback.LinkRequest
 import com.music.bitchord.playback.MusicLink
+import com.music.bitchord.playback.OriginalVersion
 import com.music.bitchord.playback.PlayerDeepLink
 import com.music.bitchord.playback.QueueBuilder
 import com.music.bitchord.playback.QueueShuffle
@@ -136,12 +137,14 @@ import com.music.bitchord.playback.autoplaySectionStart
 import com.music.bitchord.playback.beginRadioQueue
 import com.music.bitchord.playback.commitRadioQueue
 import com.music.bitchord.playback.fromAutoplay
+import com.music.bitchord.playback.hasYouTubeOriginal
 import com.music.bitchord.playback.loadAutoplayTracks
 import com.music.bitchord.playback.playSongs
 import com.music.bitchord.playback.toMediaItem
 import com.music.bitchord.playback.toSong
 import com.music.bitchord.playback.toDirectYouTubeMediaItem
 import com.music.bitchord.playback.toggleAutoplay
+import com.music.bitchord.playback.upgradeQuality
 import com.music.bitchord.download.DownloadSession
 import com.music.bitchord.download.DownloadStore
 import com.music.bitchord.download.DownloadTarget
@@ -532,6 +535,9 @@ private fun BitChordApp(
     var songSort by remember(detail?.browseId) { mutableStateOf(SongSort.DEFAULT) }
     var songSortMenuOpen by remember { mutableStateOf(false) }
     val likeStatuses by viewModel.likeStatuses.collectAsStateWithLifecycle()
+    // Which tracks are being held on YouTube's own upload, so the player's menu
+    // offers the way back out of a revert rather than the revert again.
+    val pinnedToOriginal by OriginalVersion.pinned.collectAsStateWithLifecycle()
     val playlists by viewModel.playlists.collectAsStateWithLifecycle()
     val playlistsLoading by viewModel.playlistsLoading.collectAsStateWithLifecycle()
 
@@ -1054,6 +1060,39 @@ private fun BitChordApp(
     }
 
     /**
+     * The track a song card stands for, or null if the card is a collection.
+     *
+     * The card's own subtitle is billed as "Song • Chelsea Wolfe"; only the
+     * credit belongs in the field the player, mini player and everything
+     * downstream read.
+     */
+    val shelfSong: (ShelfItem) -> Song? = { item ->
+        item.videoId?.let { videoId ->
+            Song(
+                videoId = videoId,
+                title = item.title,
+                artist = InnertubeParser.artistFromSubtitle(item.subtitle),
+                thumbnailUrl = item.thumbnailUrl,
+            )
+        }
+    }
+
+    /**
+     * Holding a card on a feed whose shelves mix tracks with collections —
+     * Quick picks and Recently played are songs, Listen again is either.
+     *
+     * [onBrowseLongPress] alone answered only half of them: a track card
+     * carries a videoId and no browse id, so holding one fell through its
+     * null check and nothing opened. Dispatched on the same test as the tap
+     * below, so a card that plays a song offers the track menu and a card that
+     * opens a page offers the album / playlist one.
+     */
+    val onShelfLongPress: (ShelfItem) -> Unit = { item ->
+        val song = shelfSong(item)
+        if (song != null) openSongMenu(song) else onBrowseLongPress(item)
+    }
+
+    /**
      * Hands [action] the target's whole track list.
      *
      * A card has no tracks behind it — its page was never opened — so the
@@ -1178,7 +1217,31 @@ private fun BitChordApp(
         val saved = Downloads.saved.value
         // Already on disk, and already queued or running: neither needs asking
         // again. What's left is what a tap on "Download" actually means.
-        val songs = requested.filter { it.videoId !in saved }
+        //
+        // The release's cover is stamped onto any row that hasn't got one, as a
+        // last check before the tap becomes a file.
+        //
+        // An album page bills its artwork once, in the header — its track rows
+        // carry no thumbnail at all, see [InnertubeParser.parseResponsiveListItem]
+        // — and a row that reaches [MediaTagger.artworkFor] with a null url is a
+        // track saved with no cover in the file and none in [SavedSongMetadata]
+        // either, so nothing downstream can draw one afterwards.
+        // `MainViewModel.withArtwork` normally fills those in as a page loads and
+        // covers the usual route here; this is the backstop for a list that
+        // reached this function some other way, and it is worth having precisely
+        // because the failure is silent and permanent — the file is written
+        // without a cover, and re-downloading adopts the untagged copy rather
+        // than replacing it.
+        val songs = requested
+            .filter { it.videoId !in saved }
+            .map { song ->
+                val cover = from?.thumbnailUrl
+                if (song.thumbnailUrl.isNullOrBlank() && !cover.isNullOrBlank()) {
+                    song.copy(thumbnailUrl = cover)
+                } else {
+                    song
+                }
+            }
         // Asked here as well as inside [Downloads.enqueue] — not instead of it.
         // Enqueue is the invariant and has to refuse whoever calls it, including
         // the storage-permission continuation below, which resumes long enough
@@ -1934,6 +1997,14 @@ private fun BitChordApp(
                             } else {
                                 null
                             },
+                            // Same rule for the artist page's subscribe circle:
+                            // a channel subscription is the account's, so a
+                            // guest is never shown the button.
+                            onToggleSubscription = if (signedIn) {
+                                { viewModel.toggleSubscription(page.browseId) }
+                            } else {
+                                null
+                            },
                             songSort = songSort,
                             contentPadding = listPadding,
                         )
@@ -1945,20 +2016,9 @@ private fun BitChordApp(
                             signedIn = signedIn,
                             onSignIn = { webSession = WebSessionMode.SIGN_IN },
                             onItemClick = { item ->
+                                val song = shelfSong(item)
                                 when {
-                                    item.videoId != null -> playRadio(
-                                        Song(
-                                            videoId = item.videoId,
-                                            title = item.title,
-                                            // The card's own subtitle is billed
-                                            // as "Song • Chelsea Wolfe"; only
-                                            // the credit belongs in the field
-                                            // the player, mini player and
-                                            // everything downstream read.
-                                            artist = InnertubeParser.artistFromSubtitle(item.subtitle),
-                                            thumbnailUrl = item.thumbnailUrl,
-                                        ),
-                                    )
+                                    song != null -> playRadio(song)
                                     item.browseId != null -> viewModel.openDetail(
                                         browseId = item.browseId,
                                         title = item.title,
@@ -1967,7 +2027,7 @@ private fun BitChordApp(
                                     )
                                 }
                             },
-                            onItemLongPress = onBrowseLongPress,
+                            onItemLongPress = onShelfLongPress,
                             onRetry = viewModel::loadHome,
                             refreshing = MainViewModel.Feed.HOME in refreshing,
                             onRefresh = { viewModel.refresh(MainViewModel.Feed.HOME) },
@@ -2316,6 +2376,7 @@ private fun BitChordApp(
                         viewModel.closeMoodGenre()
                         showSettings = false
                         showAccountScrobbling = false
+                        showSources = false
                         showReplay = false
                         showHistory = false
                         libraryShowAll = null
@@ -2542,7 +2603,20 @@ private fun BitChordApp(
                     // whatever ids it's ever going to have.
                     resolvingLinks = fromPlayer && linksLoading,
                     showSleepTimer = fromPlayer,
-                    onRollbackToOriginal = if (fromPlayer && player.isQualityUpgraded &&
+                    // Offered for every playing track with a YouTube upload
+                    // behind it, not only for one an upgrade visibly swapped:
+                    // a source ranked above YouTube can be playing its own
+                    // idea of the song from the first second, and a wrong
+                    // match sounds like a wrong match whether or not anything
+                    // announced itself. See [Song.hasYouTubeOriginal].
+                    onRollbackToOriginal = if (fromPlayer &&
+                        song.hasYouTubeOriginal() &&
+                        // Nothing to revert *from*: the listener is hearing a
+                        // file they saved, not a stream anything chose.
+                        song.localUri == null &&
+                        // Already there, and the menu says so with the row
+                        // below instead.
+                        song.videoId !in pinnedToOriginal &&
                         controller?.currentMediaItem?.mediaId == song.videoId
                     ) {
                         rollback@{
@@ -2551,11 +2625,35 @@ private fun BitChordApp(
                             if (index !in 0 until c.mediaItemCount ||
                                 c.currentMediaItem?.mediaId != song.videoId
                             ) return@rollback
+                            // Written down before the item is replaced, so
+                            // every entry built for this song from here on is
+                            // built as this one — see [OriginalVersion]. Without
+                            // it the revert lasted exactly as long as this queue
+                            // entry did, and the next play put the listener back
+                            // on the copy they had just rejected.
+                            OriginalVersion.pin(song.videoId)
                             val position = c.currentPosition
                             val wasPlaying = c.isPlaying
                             c.replaceMediaItem(index, song.toDirectYouTubeMediaItem())
                             c.seekTo(index, position)
                             if (wasPlaying) c.play()
+                            songActions = null
+                        }
+                    } else {
+                        null
+                    },
+                    // The way back, and the only one: a pinned track is held
+                    // off the automatic search on purpose, so nothing but this
+                    // will ever offer it a better copy again.
+                    onUpgradeQuality = if (fromPlayer && song.videoId in pinnedToOriginal &&
+                        // A track playing off a file the listener saved is not
+                        // playing a stream anything could upgrade — the pin on
+                        // it is only waiting for the day it is streamed again.
+                        song.localUri == null &&
+                        controller?.currentMediaItem?.mediaId == song.videoId
+                    ) {
+                        {
+                            controller.upgradeQuality()
                             songActions = null
                         }
                     } else {

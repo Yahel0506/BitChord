@@ -92,6 +92,32 @@ data class Song(
 fun Song.artworkAt(px: Int): String? = thumbnailUrl.artworkAt(px)
 
 /**
+ * Whether a row is the track the player is on, for the now-playing highlight.
+ *
+ * Title and credit, matched exactly, and nothing else. Every id a row could be
+ * matched on instead is scoped to where the row came from and so lies when
+ * asked across that boundary: a set-video-id names a slot in one playlist, and
+ * two playlists hand the same one to unrelated tracks, which is what used to
+ * light up a stranger's row while something else played. A video id is no
+ * better across catalogues — the same recording arrives with a different id
+ * from a local file, a download and a module source, and the highlight would
+ * simply go missing.
+ *
+ * The cost is that name and credit are not unique: an album track and its
+ * appearance on a compilation are one and the same to this, and both light up.
+ * That is the trade the highlight is meant to make — it says "this is the song
+ * you are hearing", not "this is the queue entry you are hearing".
+ *
+ * The one place that must not use this is the player's own queue, where the
+ * entry, not the song, is what the row stands for — that list matches on
+ * position.
+ */
+fun Song.isSameTrackAs(other: Song?): Boolean {
+    other ?: return false
+    return title == other.title && artist == other.artist
+}
+
+/**
  * [Song.durationText] in milliseconds, or 0 when the row didn't state one.
  *
  * A row's duration is a display string — YouTube sends `"3:45"`, not a
@@ -143,6 +169,19 @@ const val HEADER_ART_PX = 720
  * copy: unlike a list row, nothing goes back for a better one later.
  */
 const val NOTIFICATION_ART_PX = 544
+
+/**
+ * Artwork for the full player — the sleeve and the full-bleed banner both, and
+ * the largest rung on the ladder.
+ *
+ * Named here rather than left as a private constant in the player because the
+ * home-screen widget picks its own size off this ladder, and a size only one
+ * surface asks for is a cache entry only that surface fills. A large widget and
+ * an open player were fetching the same cover twice at two sizes, and either
+ * fetch could fail on its own — so the two could disagree about whether the
+ * track had artwork at all.
+ */
+const val PLAYER_ART_PX = 1200
 
 enum class BrowseType { ALBUM, ARTIST, PLAYLIST, OTHER }
 
@@ -294,6 +333,12 @@ data class DetailPage(
     val subscriberCountText: String? = null,
     /** "3.4M monthly listeners" off an artist page's header. */
     val monthlyListenerCount: String? = null,
+    /**
+     * Whether this artist's channel can be subscribed to and whether it already
+     * is — null when the page doesn't offer it. Only ever set for an artist page
+     * fetched with a session; see [SubscriptionState].
+     */
+    val subscription: SubscriptionState? = null,
 )
 
 /**
@@ -308,6 +353,20 @@ data class DetailPage(
 data class LibraryState(
     val playlistId: String,
     val saved: Boolean,
+)
+
+/**
+ * Whether an artist's channel is subscribed to, and the channel that changes.
+ *
+ * An artist page is a channel page underneath, and subscribing is the YouTube
+ * verb rather than a Music one: it takes the `UC…` channel id, which is also the
+ * page's own browse id. Read off the header's subscribe button rather than
+ * assumed from the browse id, because the button is also what says whether
+ * YouTube offers the action here at all.
+ */
+data class SubscriptionState(
+    val channelId: String,
+    val subscribed: Boolean,
 )
 
 /** Parsed artist landing page. */
@@ -326,6 +385,8 @@ data class ArtistPage(
     val subscriberCountText: String? = null,
     /** "3.4M monthly listeners", off the same header. */
     val monthlyListenerCount: String? = null,
+    /** The header's subscribe button, when the page carries one. */
+    val subscription: SubscriptionState? = null,
 )
 
 /**
