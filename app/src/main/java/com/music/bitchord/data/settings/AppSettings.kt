@@ -9,20 +9,19 @@ import androidx.media3.common.Player
 import com.music.bitchord.BuildConfig
 import com.music.bitchord.auth.AuthStore
 import com.music.bitchord.data.lyrics.LyricsSource
+import com.music.bitchord.data.sources.SourceKind
 import kotlinx.coroutines.flow.MutableStateFlow
 
 /**
  * Stream bitrate ceiling on the YouTube fallback path — MEDIUM, HIGH and
  * LOSSLESS all mean "whatever the best available Opus format is" there; what
  * actually tells them apart is which other sources are allowed to answer
- * *before* YouTube gets asked. That part is
- * [SourceRegistry.applyQualityPreset][com.music.bitchord.data.sources.SourceRegistry.applyQualityPreset]'s
- * job, kept in step with whichever rung is picked here:
+ * *before* YouTube gets asked. That part is [permits], and the rungs read:
  *
- * - [LOSSLESS] — Ricky's Addon (the built-in module source) and JioSaavn both on.
- * - [HIGH] — Ricky's Addon off, JioSaavn on.
- * - [MEDIUM] and [LOW] — both off; YouTube's own Opus ladder is all there is,
- *   capped at [maxKbps].
+ * - [LOSSLESS] — Ricky's Addon (the built-in module source) and JioSaavn both asked.
+ * - [HIGH] — the modules skipped, JioSaavn asked.
+ * - [MEDIUM] and [LOW] — both skipped; YouTube's own Opus ladder is all there
+ *   is, capped at [maxKbps].
  *
  * [hourly] is what the ceiling costs in data over an hour of listening, which
  * is the only part of this a user actually cares about on a metered plan.
@@ -37,6 +36,34 @@ enum class AudioQuality(
     MEDIUM(Int.MAX_VALUE, "Medium", "Best available · ~171 kbps Opus", "77 MB/hr"),
     HIGH(Int.MAX_VALUE, "High", "JioSaavn up to 320kbps, YouTube fallback", "144 MB/hr"),
     LOSSLESS(Int.MAX_VALUE, "Lossless", "Ricky's Addon + JioSaavn, bit-exact where available", "300+ MB/hr"),
+    ;
+
+    /**
+     * Whether a stream started under this ceiling may be served by [kind].
+     *
+     * Asked per stream rather than written into
+     * [SourceConfig.enabled][com.music.bitchord.data.sources.SourceConfig.enabled],
+     * which is what this used to do — an `applyQualityPreset` call flipped the
+     * module and JioSaavn switches the moment a rung was picked. Two things
+     * were wrong with that and both were reported together: picking a rung for
+     * *mobile data* turned the sources off while sitting on Wi-Fi, and nothing
+     * turned them back on when the connection changed, so a Wi-Fi ceiling of
+     * Lossless still had no lossless source to reach. A ceiling is a property
+     * of the connection in force; the switches on the Sources screen are the
+     * user's standing choice. Storing the first in the second lost the second.
+     *
+     * [SourceKind.YOUTUBE] is permitted on every rung: it is what [maxKbps]
+     * caps, and it is the only source that can answer at all when the ones
+     * above it are skipped.
+     */
+    fun permits(kind: SourceKind): Boolean = when (this) {
+        LOSSLESS -> true
+        // No lossless answer is wanted here, and a module is the slow half of
+        // the source list — several seconds of QuickJS and backend walks to
+        // land on a transcode JioSaavn already has at 320.
+        HIGH -> !kind.canServeLossless
+        MEDIUM, LOW -> kind == SourceKind.YOUTUBE
+    }
 }
 
 /**
@@ -226,6 +253,30 @@ object AppSettings {
 
     /** Prefer an attached USB audio output over the system's normal route. */
     val preferUsbDac = MutableStateFlow(false)
+
+    /**
+     * Whether a source offering a Dolby Atmos rendition is allowed to serve it.
+     *
+     * On by default: where the device can decode it, Atmos is the premium
+     * rendition the catalogue holds and the one most people are paying a
+     * subscription for.
+     *
+     * Off is a real preference and not just a safety valve. Atmos is E-AC-3,
+     * which is *lossy* — a track with an Atmos master is frequently also held
+     * as a FLAC, and someone listening on wired headphones may well prefer the
+     * bit-exact stereo copy to a spatial mix their output can't render. Turning
+     * this off is how they say so; see
+     * [ModuleSource.unplayable][com.music.bitchord.data.sources.ModuleSource],
+     * which is where the refusal is applied.
+     *
+     * Independent of whether the device *can* decode it — that question is
+     * [DeviceCodecs.playsDolbyAtmos][com.music.bitchord.data.sources.DeviceCodecs],
+     * and the two are deliberately not folded together: this one is the
+     * listener's answer, is persisted, and must survive being read on a phone
+     * that cannot honour it (a restored backup, a swapped device) without
+     * quietly rewriting itself.
+     */
+    val dolbyAtmos = MutableStateFlow(true)
 
     /**
      * Widens stereo output via [com.music.bitchord.playback.SpatialAudioProcessor],
@@ -561,6 +612,7 @@ object AppSettings {
             )
         }.getOrDefault(OutputPcmMode.PCM_16)
         preferUsbDac.value = prefs.getBoolean(KEY_PREFER_USB_DAC, false)
+        dolbyAtmos.value = prefs.getBoolean(KEY_DOLBY_ATMOS, true)
         spatialAudio.value = prefs.getBoolean(KEY_SPATIAL_AUDIO, false)
         playbackSpeed.value = prefs.getFloat(KEY_SPEED, 1.0f)
         themeMode.value = runCatching {
@@ -789,6 +841,11 @@ object AppSettings {
     fun setSkipSilence(value: Boolean) {
         skipSilence.value = value
         prefs.edit().putBoolean(KEY_SKIP_SILENCE, value).apply()
+    }
+
+    fun setDolbyAtmos(value: Boolean) {
+        dolbyAtmos.value = value
+        prefs.edit().putBoolean(KEY_DOLBY_ATMOS, value).apply()
     }
 
     fun setSpatialAudio(value: Boolean) {
@@ -1324,6 +1381,7 @@ object AppSettings {
     private const val KEY_SKIP_SILENCE = "skip_silence"
     private const val KEY_OUTPUT_PCM_MODE = "output_pcm_mode"
     private const val KEY_PREFER_USB_DAC = "prefer_usb_dac"
+    private const val KEY_DOLBY_ATMOS = "dolby_atmos"
     private const val KEY_SPATIAL_AUDIO = "spatial_audio"
     private const val KEY_SPEED = "playback_speed"
     private const val KEY_THEME = "theme_mode"

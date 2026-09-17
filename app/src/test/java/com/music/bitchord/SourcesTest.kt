@@ -94,6 +94,31 @@ class SourcesTest {
     }
 
     /**
+     * ...and premium only where it is allowed to play. E-AC-3 ships with the
+     * vendor image, not with Android, and a module that answers every request
+     * with its Atmos master — the Tidal one does — hands a device without that
+     * decoder a stream that cannot be selected, let alone played. Refusing it
+     * at the source is what sends the track to somebody who can serve it;
+     * nothing downstream gets a second chance to notice.
+     *
+     * The listener's own switch enters by the same door, because refusing for
+     * taste and refusing for hardware have to leave the resolver in the same
+     * state — anything else is a second code path for the rarer case.
+     */
+    @Test
+    fun `an Atmos rendition is refused when it is not allowed to play`() {
+        val atmos = StreamFormat(codec = "eac3-joc")
+        assertTrue(ModuleSource.unplayable(atmos, atmosAllowed = false))
+        assertFalse(ModuleSource.unplayable(atmos, atmosAllowed = true))
+
+        // Nothing else is affected either way: a FLAC is a FLAC on every phone,
+        // and an undescribed stream is still worth handing to the decoder.
+        val flac = StreamFormat(codec = "flac", bitDepth = 16, sampleRateHz = 44_100)
+        assertFalse(ModuleSource.unplayable(flac, atmosAllowed = false))
+        assertFalse(ModuleSource.unplayable(StreamFormat(), atmosAllowed = false))
+    }
+
+    /**
      * The badge tiers. "Hi-Quality" exists to separate a module's 320kbps
      * stream from YouTube's 160kbps Opus, which the screen otherwise renders
      * identically — as nothing at all.
@@ -114,20 +139,72 @@ class SourcesTest {
         assertFalse(flac.isHiQuality)
     }
 
-    /** With no measured bitrate, what the source said it was sending will do. */
+    /**
+     * A tier is earned by the stream, never by the offer. A module that
+     * advertises LOSSLESS and then serves a 128kbps SoundCloud transcode is
+     * the ordinary case, so nothing in [claimed] promotes a badge on its own.
+     */
     @Test
-    fun `falls back to the declared bitrate for the quality tier`() {
-        val claimed = NerdStats.Snapshot(
+    fun `the declared format never earns a quality tier by itself`() {
+        val claimedHiQuality = NerdStats.Snapshot(
             mimeType = "audio/mp4a-latm",
             bitrateKbps = null,
             sampleRateHz = 44_100,
             channels = 2,
             claimed = StreamFormat(codec = "aac", kbps = 320),
         )
-        assertTrue(claimed.isHiQuality)
+        assertFalse(claimedHiQuality.isHiQuality)
+
+        val claimedLossless = NerdStats.Snapshot(
+            mimeType = "audio/opus",
+            bitrateKbps = 128,
+            sampleRateHz = 48_000,
+            channels = 2,
+            claimed = StreamFormat(codec = "flac", sampleRateHz = 96_000, bitDepth = 24),
+        )
+        assertFalse(claimedLossless.isLossless)
+        assertFalse(claimedLossless.isHiRes)
 
         val silent = NerdStats.Snapshot(mimeType = "audio/mp4a-latm", bitrateKbps = null, sampleRateHz = null, channels = null)
         assertFalse(silent.isHiQuality)
+    }
+
+    /**
+     * Hi-Res is drawn off the measured depth and rate, which for a FLAC in MP4
+     * only exist because the stream's own STREAMINFO was read — the container
+     * states the rate as zero. See `PlaybackService.measure`.
+     */
+    @Test
+    fun `hi-res is decided on measured depth and rate`() {
+        val cd = NerdStats.Snapshot(
+            mimeType = "audio/flac",
+            bitrateKbps = 1411,
+            sampleRateHz = 44_100,
+            channels = 2,
+            bitDepth = 16,
+        )
+        assertTrue(cd.isLossless)
+        assertFalse(cd.isHiRes)
+
+        val hiRes = NerdStats.Snapshot(
+            mimeType = "audio/flac",
+            bitrateKbps = 4608,
+            sampleRateHz = 96_000,
+            channels = 2,
+            bitDepth = 24,
+        )
+        assertTrue(hiRes.isHiRes)
+
+        // Nothing measured yet: no badge, however loud the claim.
+        val unmeasured = NerdStats.Snapshot(
+            mimeType = null,
+            bitrateKbps = null,
+            sampleRateHz = null,
+            channels = null,
+            claimed = StreamFormat(codec = "flac", sampleRateHz = 192_000, bitDepth = 24),
+        )
+        assertFalse(unmeasured.isLossless)
+        assertFalse(unmeasured.isHiRes)
     }
 
     // ---- Cross-source matching ---------------------------------------------

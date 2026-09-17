@@ -137,6 +137,7 @@ import com.music.bitchord.playback.autoplaySectionStart
 import com.music.bitchord.playback.beginRadioQueue
 import com.music.bitchord.playback.commitRadioQueue
 import com.music.bitchord.playback.fromAutoplay
+import com.music.bitchord.playback.hasYouTubeOriginal
 import com.music.bitchord.playback.loadAutoplayTracks
 import com.music.bitchord.playback.playSongs
 import com.music.bitchord.playback.toMediaItem
@@ -1059,6 +1060,39 @@ private fun BitChordApp(
     }
 
     /**
+     * The track a song card stands for, or null if the card is a collection.
+     *
+     * The card's own subtitle is billed as "Song • Chelsea Wolfe"; only the
+     * credit belongs in the field the player, mini player and everything
+     * downstream read.
+     */
+    val shelfSong: (ShelfItem) -> Song? = { item ->
+        item.videoId?.let { videoId ->
+            Song(
+                videoId = videoId,
+                title = item.title,
+                artist = InnertubeParser.artistFromSubtitle(item.subtitle),
+                thumbnailUrl = item.thumbnailUrl,
+            )
+        }
+    }
+
+    /**
+     * Holding a card on a feed whose shelves mix tracks with collections —
+     * Quick picks and Recently played are songs, Listen again is either.
+     *
+     * [onBrowseLongPress] alone answered only half of them: a track card
+     * carries a videoId and no browse id, so holding one fell through its
+     * null check and nothing opened. Dispatched on the same test as the tap
+     * below, so a card that plays a song offers the track menu and a card that
+     * opens a page offers the album / playlist one.
+     */
+    val onShelfLongPress: (ShelfItem) -> Unit = { item ->
+        val song = shelfSong(item)
+        if (song != null) openSongMenu(song) else onBrowseLongPress(item)
+    }
+
+    /**
      * Hands [action] the target's whole track list.
      *
      * A card has no tracks behind it — its page was never opened — so the
@@ -1183,7 +1217,31 @@ private fun BitChordApp(
         val saved = Downloads.saved.value
         // Already on disk, and already queued or running: neither needs asking
         // again. What's left is what a tap on "Download" actually means.
-        val songs = requested.filter { it.videoId !in saved }
+        //
+        // The release's cover is stamped onto any row that hasn't got one, as a
+        // last check before the tap becomes a file.
+        //
+        // An album page bills its artwork once, in the header — its track rows
+        // carry no thumbnail at all, see [InnertubeParser.parseResponsiveListItem]
+        // — and a row that reaches [MediaTagger.artworkFor] with a null url is a
+        // track saved with no cover in the file and none in [SavedSongMetadata]
+        // either, so nothing downstream can draw one afterwards.
+        // `MainViewModel.withArtwork` normally fills those in as a page loads and
+        // covers the usual route here; this is the backstop for a list that
+        // reached this function some other way, and it is worth having precisely
+        // because the failure is silent and permanent — the file is written
+        // without a cover, and re-downloading adopts the untagged copy rather
+        // than replacing it.
+        val songs = requested
+            .filter { it.videoId !in saved }
+            .map { song ->
+                val cover = from?.thumbnailUrl
+                if (song.thumbnailUrl.isNullOrBlank() && !cover.isNullOrBlank()) {
+                    song.copy(thumbnailUrl = cover)
+                } else {
+                    song
+                }
+            }
         // Asked here as well as inside [Downloads.enqueue] — not instead of it.
         // Enqueue is the invariant and has to refuse whoever calls it, including
         // the storage-permission continuation below, which resumes long enough
@@ -1958,20 +2016,9 @@ private fun BitChordApp(
                             signedIn = signedIn,
                             onSignIn = { webSession = WebSessionMode.SIGN_IN },
                             onItemClick = { item ->
+                                val song = shelfSong(item)
                                 when {
-                                    item.videoId != null -> playRadio(
-                                        Song(
-                                            videoId = item.videoId,
-                                            title = item.title,
-                                            // The card's own subtitle is billed
-                                            // as "Song • Chelsea Wolfe"; only
-                                            // the credit belongs in the field
-                                            // the player, mini player and
-                                            // everything downstream read.
-                                            artist = InnertubeParser.artistFromSubtitle(item.subtitle),
-                                            thumbnailUrl = item.thumbnailUrl,
-                                        ),
-                                    )
+                                    song != null -> playRadio(song)
                                     item.browseId != null -> viewModel.openDetail(
                                         browseId = item.browseId,
                                         title = item.title,
@@ -1980,7 +2027,7 @@ private fun BitChordApp(
                                     )
                                 }
                             },
-                            onItemLongPress = onBrowseLongPress,
+                            onItemLongPress = onShelfLongPress,
                             onRetry = viewModel::loadHome,
                             refreshing = MainViewModel.Feed.HOME in refreshing,
                             onRefresh = { viewModel.refresh(MainViewModel.Feed.HOME) },
@@ -2556,7 +2603,20 @@ private fun BitChordApp(
                     // whatever ids it's ever going to have.
                     resolvingLinks = fromPlayer && linksLoading,
                     showSleepTimer = fromPlayer,
-                    onRollbackToOriginal = if (fromPlayer && player.isQualityUpgraded &&
+                    // Offered for every playing track with a YouTube upload
+                    // behind it, not only for one an upgrade visibly swapped:
+                    // a source ranked above YouTube can be playing its own
+                    // idea of the song from the first second, and a wrong
+                    // match sounds like a wrong match whether or not anything
+                    // announced itself. See [Song.hasYouTubeOriginal].
+                    onRollbackToOriginal = if (fromPlayer &&
+                        song.hasYouTubeOriginal() &&
+                        // Nothing to revert *from*: the listener is hearing a
+                        // file they saved, not a stream anything chose.
+                        song.localUri == null &&
+                        // Already there, and the menu says so with the row
+                        // below instead.
+                        song.videoId !in pinnedToOriginal &&
                         controller?.currentMediaItem?.mediaId == song.videoId
                     ) {
                         rollback@{
