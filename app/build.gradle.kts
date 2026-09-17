@@ -19,16 +19,10 @@ val signing = Properties().apply {
     if (file.exists()) file.inputStream().use { load(it) }
 }
 
-/**
- * Module index URL for lossless/HQ audio sourcing.
- * Set MODULE_INDEX_URL in local.properties to enable it.
- * If absent, the app builds fine — Settings will show a warning.
- */
 val localProps = Properties().apply {
     val file = rootProject.file("local.properties")
     if (file.exists()) file.inputStream().use { load(it) }
 }
-val moduleIndexUrl: String = localProps.getProperty("MODULE_INDEX_URL", "")
 val lastfmApiKey: String = (
     localProps.getProperty("LASTFM_API_KEY")
         ?: System.getenv("LASTFM_API_KEY")
@@ -40,6 +34,24 @@ val lastfmSecret: String = (
         ?: ""
     ).trim()
 
+/*
+ * Where Listen Together's party server lives. Not a credential — it is a public
+ * URL, and every device in a party has to be pointed at the same one — but it is
+ * deployment-specific rather than a property of the source, which is what puts
+ * it here beside the others instead of in a constant.
+ *
+ * Empty is a supported state, not a broken build: the field below is only the
+ * *default* the address box on the Listen Together screen starts with, and
+ * anything typed there wins and persists. So a fresh checkout without this line
+ * builds and runs, and simply asks for an address the first time somebody opens
+ * the screen. See ListenTogether.DEFAULT_SERVER.
+ */
+val listenTogetherServer: String = (
+    localProps.getProperty("LISTEN_TOGETHER_SERVER")
+        ?: System.getenv("LISTEN_TOGETHER_SERVER")
+        ?: ""
+    ).trim().trimEnd('/')
+
 android {
     namespace = "com.music.bitchord"
     compileSdk = 36
@@ -50,17 +62,19 @@ android {
         // Haze falls back to a translucent scrim below that.
         minSdk = 26
         targetSdk = 36
-        versionCode = 13
-        versionName = "1.5.1"
+        versionCode = 18
+        versionName = "1.6.1"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
-
-        // Lossless/HQ module index URL — empty string if not configured.
-        buildConfigField("String", "MODULE_INDEX_URL", "\"${moduleIndexUrl}\"")
 
         // Last.fm credentials are supplied locally and never committed.
         buildConfigField("String", "LASTFM_API_KEY", "\"${lastfmApiKey.replace("\\", "\\\\").replace("\"", "\\\"")}\"")
         buildConfigField("String", "LASTFM_SECRET", "\"${lastfmSecret.replace("\\", "\\\\").replace("\"", "\\\"")}\"")
+        buildConfigField(
+            "String",
+            "LISTEN_TOGETHER_SERVER",
+            "\"${listenTogetherServer.replace("\\", "\\\\").replace("\"", "\\\"")}\"",
+        )
     }
 
     splits {
@@ -298,6 +312,12 @@ dependencies {
     implementation("com.microsoft.onnxruntime:onnxruntime-android:1.28.0")
 
     testImplementation("junit:junit:4.13.2")
+    // A real HTTP server for the addon tests. The addon protocol is entirely
+    // "what does this app send, and what does it do with what comes back", and
+    // a hand-rolled fake of the client would be a test of the fake. Pinned to
+    // the OkHttp version already on the runtime classpath.
+    testImplementation("com.squareup.okhttp3:mockwebserver:4.12.0")
+    testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.10.2")
     androidTestImplementation("androidx.test.ext:junit:1.3.0")
     androidTestImplementation("androidx.test.espresso:espresso-core:3.7.0")
 }

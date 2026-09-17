@@ -19,7 +19,6 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
@@ -35,12 +34,9 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
-import androidx.compose.ui.text.input.PasswordVisualTransformation
-import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -84,7 +80,7 @@ fun ListenBrainzTokenAlert(
                 color = MaterialTheme.colorScheme.onSurface,
                 textAlign = TextAlign.Center,
             )
-            AlertTextField(
+            PillTextField(
                 value = tokenInput,
                 onValueChange = onTokenInputChange,
                 placeholder = stringResource(R.string.api_token),
@@ -132,7 +128,7 @@ fun LastfmLoginAlert(
                 color = if (error != null) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurface,
                 textAlign = TextAlign.Center,
             )
-            AlertTextField(
+            PillTextField(
                 value = usernameInput,
                 onValueChange = onUsernameInputChange,
                 placeholder = stringResource(R.string.username),
@@ -140,7 +136,7 @@ fun LastfmLoginAlert(
                 keyboardOptions = KeyboardOptions(imeAction = ImeAction.Next),
             )
             Spacer(Modifier.height(8.dp))
-            AlertTextField(
+            PillTextField(
                 value = passwordInput,
                 onValueChange = onPasswordInputChange,
                 placeholder = stringResource(R.string.password),
@@ -208,7 +204,7 @@ fun DiscordTokenAlert(
                 color = if (error != null) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurface,
                 textAlign = TextAlign.Center,
             )
-            AlertTextField(
+            PillTextField(
                 value = tokenInput,
                 onValueChange = onTokenInputChange,
                 placeholder = stringResource(R.string.token),
@@ -277,7 +273,7 @@ fun TextValueAlert(
                 color = MaterialTheme.colorScheme.onSurface,
                 textAlign = TextAlign.Center,
             )
-            AlertTextField(
+            PillTextField(
                 value = value,
                 onValueChange = onValueChange,
                 placeholder = placeholder,
@@ -298,6 +294,121 @@ fun TextValueAlert(
         }
         AlertRule()
         AlertAction(label = stringResource(R.string.cancel), emphasised = false, onClick = onDismiss)
+    }
+}
+
+/**
+ * Add or edit a source that has an address — the addon editor.
+ *
+ * The same frosted card every other alert in this app uses, rather than the
+ * Material `AlertDialog` this replaced. That one put a filled `OutlinedTextField`
+ * and a row of cramped text buttons in the middle of a screen where nothing
+ * else looks like that, and it read as a stock widget dropped into somebody
+ * else's design.
+ *
+ * One field and up to four stacked actions. There is deliberately no name
+ * field: an addon states its own name in its manifest, so asking the user to
+ * invent one is asking for information the addon is about to supply anyway —
+ * and a blank field would leave the row showing a bare hostname next to a
+ * perfectly good published name.
+ *
+ * [status] is the one thing here that no other alert in the file needs:
+ * testing an address has *three* outcomes rather than the usual two, and "it
+ * answered, but not with something this app can use" is the one worth reading
+ * — so a result replaces the description in place, coloured by [statusIsGood],
+ * the way [LastfmLoginAlert] surfaces a failed sign-in.
+ */
+@OptIn(ExperimentalHazeMaterialsApi::class)
+@Composable
+fun AddonEditorAlert(
+    hazeState: HazeState,
+    title: String,
+    description: String,
+    urlValue: String,
+    onUrlChange: (String) -> Unit,
+    urlPlaceholder: String,
+    /** What the last test said, or null before one has been run. */
+    status: String?,
+    statusIsGood: Boolean,
+    testing: Boolean,
+    /** Whether there is enough typed in to be worth testing or saving. */
+    canSubmit: Boolean,
+    onTest: () -> Unit,
+    onSave: () -> Unit,
+    /** Offered only for a source already stored — there is nothing to remove otherwise. */
+    onRemove: (() -> Unit)?,
+    onDismiss: () -> Unit,
+) {
+    AlertScaffold(hazeState = hazeState, onDismiss = { if (!testing) onDismiss() }) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 16.dp, vertical = 19.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+        ) {
+            Text(
+                text = title,
+                style = MaterialTheme.typography.bodyLarge.copy(fontSize = 17.sp, fontWeight = FontWeight.W600),
+                color = MaterialTheme.colorScheme.onSurface,
+                textAlign = TextAlign.Center,
+            )
+            Text(
+                text = status ?: description,
+                modifier = Modifier.padding(top = 4.dp, bottom = 14.dp),
+                style = MaterialTheme.typography.bodyMedium.copy(fontSize = 13.sp, lineHeight = 17.sp),
+                color = when {
+                    status == null -> MaterialTheme.colorScheme.onSurface
+                    statusIsGood -> MaterialTheme.colorScheme.primary
+                    else -> MaterialTheme.colorScheme.error
+                },
+                textAlign = TextAlign.Center,
+            )
+            PillTextField(
+                value = urlValue,
+                onValueChange = onUrlChange,
+                placeholder = urlPlaceholder,
+                enabled = !testing,
+                keyboardOptions = KeyboardOptions(
+                    keyboardType = KeyboardType.Uri,
+                    imeAction = ImeAction.Done,
+                ),
+                keyboardActions = KeyboardActions(onDone = { if (canSubmit && !testing) onSave() }),
+            )
+        }
+        AlertRule()
+        // Above Save rather than beside it: an address is worth checking before
+        // it is stored, and a row of three cramped buttons is what the Material
+        // dialog did badly.
+        AlertAction(
+            label = if (testing) stringResource(R.string.testing) else stringResource(R.string.test),
+            emphasised = false,
+            onClick = onTest,
+            enabled = canSubmit && !testing,
+        )
+        AlertRule()
+        AlertAction(
+            label = stringResource(R.string.save),
+            emphasised = true,
+            onClick = onSave,
+            enabled = canSubmit && !testing,
+        )
+        if (onRemove != null) {
+            AlertRule()
+            AlertAction(
+                label = stringResource(R.string.remove_source),
+                emphasised = false,
+                destructive = true,
+                onClick = onRemove,
+                enabled = !testing,
+            )
+        }
+        AlertRule()
+        AlertAction(
+            label = stringResource(R.string.cancel),
+            emphasised = false,
+            onClick = onDismiss,
+            enabled = !testing,
+        )
     }
 }
 
@@ -452,51 +563,6 @@ private fun AlertScaffold(
                     onClick = {},
                 ),
             content = content,
-        )
-    }
-}
-
-/** The narrow, pill-shaped field iOS alerts and this app's search bar both use. */
-@Composable
-private fun AlertTextField(
-    value: String,
-    onValueChange: (String) -> Unit,
-    placeholder: String,
-    modifier: Modifier = Modifier,
-    enabled: Boolean = true,
-    isPassword: Boolean = false,
-    keyboardOptions: KeyboardOptions = KeyboardOptions.Default,
-    keyboardActions: KeyboardActions = KeyboardActions.Default,
-) {
-    Box(
-        modifier = modifier
-            .fillMaxWidth()
-            .height(40.dp)
-            .background(MaterialTheme.colorScheme.surfaceVariant, RoundedCornerShape(11.dp))
-            .padding(horizontal = 12.dp),
-        contentAlignment = Alignment.CenterStart,
-    ) {
-        if (value.isEmpty()) {
-            Text(
-                text = placeholder,
-                style = MaterialTheme.typography.bodyMedium.copy(fontSize = 15.sp),
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-        }
-        BasicTextField(
-            value = value,
-            onValueChange = onValueChange,
-            enabled = enabled,
-            singleLine = true,
-            textStyle = MaterialTheme.typography.bodyMedium.copy(
-                fontSize = 15.sp,
-                color = MaterialTheme.colorScheme.onBackground,
-            ),
-            cursorBrush = SolidColor(MaterialTheme.colorScheme.primary),
-            visualTransformation = if (isPassword) PasswordVisualTransformation() else VisualTransformation.None,
-            keyboardOptions = keyboardOptions,
-            keyboardActions = keyboardActions,
-            modifier = Modifier.fillMaxWidth(),
         )
     }
 }
