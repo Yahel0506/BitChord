@@ -22,6 +22,7 @@ import okhttp3.HttpUrl.Companion.toHttpUrl
 object BetterLyrics {
 
     private const val BASE = "https://lyrics-api.boidu.dev/getLyrics"
+    private const val PORTATO = "https://lyrics-api.boidu.dev/qq/getLyrics"
 
     suspend fun artifact(
         title: String,
@@ -52,6 +53,26 @@ object BetterLyrics {
             content = ttml,
             lines = lines,
         )
+    }
+
+    /** QQ Music's karaoke timings through BetterLyrics' Portato endpoint. */
+    suspend fun portato(
+        title: String,
+        artist: String,
+        durationMs: Long,
+        album: String? = null,
+    ): List<LyricLine>? = withContext(Dispatchers.IO) {
+        val url = PORTATO.toHttpUrl().newBuilder()
+            .addQueryParameter("s", title)
+            .addQueryParameter("a", artist)
+            .apply {
+                val seconds = durationMs / 1000
+                if (seconds > 0) addQueryParameter("d", seconds.toString())
+                if (!album.isNullOrBlank()) addQueryParameter("al", album)
+            }
+            .build()
+        val body = lyricsGet(url.toString()) ?: return@withContext null
+        ProviderLyrics.parse(body)
     }
 
     suspend fun lyrics(

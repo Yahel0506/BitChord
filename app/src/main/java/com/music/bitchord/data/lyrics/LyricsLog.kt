@@ -7,21 +7,9 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 
-/**
- * Live logger for lyrics fetching operations.
- *
- * Records connection attempts to various lyric APIs (LRCLIB, Musixmatch, BetterLyrics, etc.)
- * and the step-by-step scraping progress of the Genius fallback.
- * Displayed in the lyrics menu/panel when enabled in Settings.
- */
+/** Live logger for lyrics fetching operations shown by the lyrics UI. */
 object LyricsLog {
-
-    enum class Level {
-        INFO,
-        SUCCESS,
-        WARN,
-        ERROR
-    }
+    enum class Level { INFO, SUCCESS, WARN, ERROR }
 
     data class Entry(
         val timestamp: Long = System.currentTimeMillis(),
@@ -29,21 +17,16 @@ object LyricsLog {
         val message: String,
         val level: Level = Level.INFO,
     ) {
-        val formattedTime: String by lazy {
-            timeFormat.format(Date(timestamp))
-        }
+        val formattedTime: String by lazy { timeFormat.format(Date(timestamp)) }
     }
 
     private val timeFormat = SimpleDateFormat("HH:mm:ss.SSS", Locale.ROOT)
     private const val MAX_ENTRIES = 120
-
     private val _entries = MutableStateFlow<List<Entry>>(emptyList())
     val entries: StateFlow<List<Entry>> = _entries.asStateFlow()
 
     @Synchronized
-    fun clear() {
-        _entries.value = emptyList()
-    }
+    fun clear() { _entries.value = emptyList() }
 
     @Synchronized
     fun log(tag: String, message: String, level: Level = Level.INFO) {
